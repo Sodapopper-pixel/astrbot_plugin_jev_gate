@@ -48,7 +48,9 @@ Jev 是 System One 模型：不生成文字，只回答你定义好的结构化�
 
 ## 安装
 
-1. 在 AstrBot 插件市场搜索 **Jev 主动回复门控** 安装（或在 WebUI 插件页上传本仓库 zip）
+1. 安装插件，二选一：
+   - **插件市场**：AstrBot WebUI → 插件 → 插件市场，搜索 **Jev 主动回复门控**（上架后可用）
+   - **从仓库装**：WebUI → 插件 → 安装插件 → 填本仓库地址 `https://github.com/Sodapopper-pixel/astrbot_plugin_jev_gate`（依赖 git，需要装 git 客户端）
 2. 在 [console.typesafe.ai/keys](https://console.typesafe.ai/keys) 申请 TypeSafe API Key
 3. 重载插件
 

@@ -1,0 +1,33 @@
+name: astrbot_plugin_jev_gate
+display_name: Jev 主动回复门控
+short_desc: 用 Jev 模型给群聊消息打分，只在真值得接话时才触发一次主动回复
+desc: |
+  AstrBot 主动回复插件：把群消息交给 TypeSafe Jev（System One）模型打分，
+  按阈值提名"值得接话"的消息，再在 AstrBot 管线内触发一次正常的主动回复。
+
+  插件只负责**判断与触发**，不组装上下文、不直发消息：人格、对话历史、
+  分段、占位符匹配、落库全部走 AstrBot 主线，因此主动回复和普通回复没有区别。
+
+  特点：
+  - 代码规则 + Jev 概率判断两段式，单条消息约 $0.0001，比逐条问大模型便宜三个数量级
+  - 人设、判断问题（可自定义/新增）、提名阈值全部可配
+  - 默认 dry-run：只打分写账本，确认提名质量后再开启实发
+  - 冷却时间、每日触发上限、每日评估上限三重护栏
+  - 触发时会把提名原因告知 bot，bot 仍可自行拒绝（输出 [PASS]）
+
+  使用前需要自备 TypeSafe API Key（https://console.typesafe.ai/keys）。
+version: 0.3.0
+author: terk
+repo: https://github.com/Sodapopper-pixel/astrbot_plugin_jev_gate
+astrbot_version: ">=4.25.0"
+support_platforms:
+  - aiocqhttp
+tags:
+  - 群聊
+  - 主动回复
+  - 主动对话
+  - 门控
+  - 上下文
+  - TypeSafe
+  - Jev
+social_link: https://github.com/Sodapopper-pixel

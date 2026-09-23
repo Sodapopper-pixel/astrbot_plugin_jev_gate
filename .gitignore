@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 插件运行数据（账本写在 AstrBot 的 data/plugin_data/ 下，不在仓库里）
+data/
+*.jsonl
+*.log
+
+.DS_Store
+.idea/
+.vscode/

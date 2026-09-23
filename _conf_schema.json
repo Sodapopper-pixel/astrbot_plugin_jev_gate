@@ -1,0 +1,125 @@
+{
+  "enabled_sessions": {
+    "description": "启用的会话 (UMO)",
+    "type": "list",
+    "default": [],
+    "hint": "格式 platform:MessageType:session_id，如 QQ:GroupMessage:123456789；也可填 \"*\" 表示所有群。留空 = 不工作（只打分不触发的 dry-run 也要填）"
+  },
+  "api_key": {
+    "description": "TypeSafe API Key",
+    "type": "string",
+    "default": "",
+    "hint": "在 console.typesafe.ai 申请。明文存在插件配置文件里，只在本机使用"
+  },
+  "model": {
+    "description": "Jev 模型 ID",
+    "type": "string",
+    "default": "jev-1.13.0",
+    "hint": "建议钉版本号而不用 latest 别名：阈值是按具体版本调的，别名升级可能让判定漂移"
+  },
+  "persona": {
+    "description": "bot 人设描述（发给 Jev 当背景）",
+    "type": "text",
+    "default": "",
+    "hint": "写清 bot 的名字/群里常用称呼、性格、常聊话题。Jev 靠这段判断“这条消息是不是在说它”，写得越具体越准。{self_id} 会自动替换成本次消息所属 bot 的账号。留空用内置通用文案"
+  },
+  "questions": {
+    "description": "评估问题定义（JSON）",
+    "type": "text",
+    "default": "{\n  \"is_mentioned\": {\n    \"type\": \"noul\",\n    \"instructions\": \"目标消息是否在点名 QQ {self_id} 或直接对它说话？\",\n    \"criteria\": {\n      \"true\": \"叫了它的名字、群里常用的称呼或昵称，或话头明显是对它说的——包括暗指和含沙射影\",\n      \"false\": \"没有针对它：@其他机器人、@其他群友、或群内普通对话都不算\"\n    }\n  },\n  \"is_answerable\": {\n    \"type\": \"noul\",\n    \"instructions\": \"目标消息是否提出了一个可以回答的问题或请求？\",\n    \"criteria\": {\n      \"true\": \"在提问、求助、征求意见，或抛出了一个可以接的话头\",\n      \"false\": \"陈述、自言自语、表情、复读、纯吐槽无问号\"\n    }\n  },\n  \"is_unanswered\": {\n    \"type\": \"noul\",\n    \"instructions\": \"目标消息提出的问题，在它之前的对话里还没有人回答过？\",\n    \"criteria\": {\n      \"true\": \"之前的消息没有人回答这个问题\",\n      \"false\": \"前面已经有人回答或解决了\"\n    }\n  },\n  \"is_good_moment\": {\n    \"type\": \"noul\",\n    \"instructions\": \"此刻机器人接话是否自然得体？\",\n    \"criteria\": {\n      \"true\": \"对话节奏允许加入，接话不会打断别人正在进行的话题\",\n      \"false\": \"群里正专注聊别的事，或两人对话正浓，插话会尴尬\"\n    }\n  },\n  \"is_persona_fit\": {\n    \"type\": \"noul\",\n    \"instructions\": \"这条消息的话题是否符合机器人的人设，它接话会不会有趣？\",\n    \"criteria\": {\n      \"true\": \"话题与机器人的人设、兴趣或常聊领域相关，或它能给出符合人设的有趣反应\",\n      \"false\": \"话题与人设无关，接话会莫名其妙\"\n    }\n  },\n  \"reply_value\": {\n    \"type\": \"score\",\n    \"instructions\": \"综合来看，机器人主动回复这条消息的价值有多大？\",\n    \"criteria\": [\n      \"不该接：表情、复读、与人设完全无关的闲聊\",\n      \"可接可不接：有点意思但错过也无所谓\",\n      \"值得接：符合人设的问题或话题，且还没人回答\",\n      \"很适合接：点名搭话，或话题正中人设且气氛合适\"\n    ]\n  }\n}",
+    "hint": "整段是一个 JSON 对象：键 = 问题 ID（代码里要认，见 README，误删会报错或走默认），值 = {type, instructions, criteria}。type 只有 noul(是否，返回 0-1 概率) 和 score(分级，criteria 是有序数组)。可自由加问题。{self_id} 会自动替换"
+  },
+  "thresholds": {
+    "description": "提名阈值",
+    "type": "object",
+    "items": {
+      "mention": {
+        "description": "is_mentioned 提名线",
+        "type": "float",
+        "default": 0.6
+      },
+      "reply_value": {
+        "description": "reply_value 提名线",
+        "type": "float",
+        "default": 1.5
+      },
+      "good_moment": {
+        "description": "good_moment 护栏（须大于此值）",
+        "type": "float",
+        "default": 0.45
+      },
+      "answerable": {
+        "description": "is_answerable 参考线（不参与提名）",
+        "type": "float",
+        "default": 0.6
+      },
+      "unanswered": {
+        "description": "is_unanswered 参考线（不参与提名）",
+        "type": "float",
+        "default": 0.6
+      },
+      "persona_fit": {
+        "description": "is_persona_fit 参考线（不参与提名）",
+        "type": "float",
+        "default": 0.55
+      }
+    },
+    "hint": "提名条件：is_mentioned >= mention，或（reply_value >= reply_value 且 is_good_moment > good_moment）。写进 Jev 的问题 ID 才有阈值可调"
+  },
+  "context_window": {
+    "description": "评估时附带的历史消息条数",
+    "type": "int",
+    "default": 15,
+    "minimum": 3,
+    "hint": "越大越准也越贵（token 按输入计费）。一般 10-20 够用"
+  },
+  "other_bot_ids": {
+    "description": "群里其他机器人的账号",
+    "type": "list",
+    "default": [],
+    "hint": "用于在上下文里标注“这条是别的机器人说的”。是否评估它们由下一项决定"
+  },
+  "evaluate_other_bots": {
+    "description": "是否也评估其他机器人发的消息",
+    "type": "bool",
+    "default": false
+  },
+  "cooldown_minutes": {
+    "description": "两次主动触发的间隔下限（分钟）",
+    "type": "int",
+    "default": 30,
+    "minimum": 0
+  },
+  "daily_limit": {
+    "description": "每个会话每天最多主动触发几次",
+    "type": "int",
+    "default": 5,
+    "minimum": 0
+  },
+  "max_daily_evaluations": {
+    "description": "每个会话每天最多评估几条消息（防失控烧钱）",
+    "type": "int",
+    "default": 300,
+    "minimum": 1,
+    "hint": "纯成本护栏。单次评估约 $0.0001，300 条约 $0.03/天"
+  },
+  "dry_run": {
+    "description": "dry-run（只打分记录，不触发回复）",
+    "type": "bool",
+    "default": true,
+    "hint": "建议第一次装完保持开启，跑几天看账本，确认提名质量再关掉"
+  },
+  "trigger_notice": {
+    "description": "触发提醒（随触发请求一起发给 bot）",
+    "type": "text",
+    "default": "<system>\n上面是一条没有 @ 你的群消息。门控模型评估认为它可能值得你接话，参考原因：{reason}。\n如果以你对群里氛围和话题的了解，判断不值得回应，只输出 [PASS]；\n否则就用你平时在群里的方式直接回应。\n</system>",
+    "hint": "可用占位符只有 {reason}（提名原因）。这段只对本次请求可见，不会写进对话历史。人格/对话历史/群历史都由 AstrBot 主线装配，不在这里配置"
+  },
+  "jev_timeout_seconds": {
+    "description": "Jev 单次评估超时（秒）",
+    "type": "int",
+    "default": 25,
+    "minimum": 5,
+    "hint": "超时则放弃本条。实测中位 1-2 秒、长尾偶发十几秒"
+  }
+}

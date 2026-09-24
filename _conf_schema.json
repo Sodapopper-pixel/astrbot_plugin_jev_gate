@@ -1,9 +1,22 @@
 {
+  "session_mode": {
+    "description": "会话名单模式",
+    "type": "string",
+    "default": "whitelist",
+    "options": ["whitelist", "blacklist"],
+    "hint": "whitelist（默认）= 只跑「白名单」里的会话；blacklist = 跑除「黑名单」外的所有会话"
+  },
   "enabled_sessions": {
-    "description": "启用的会话 (UMO)",
+    "description": "白名单：启用的会话 (UMO)",
     "type": "list",
     "default": [],
-    "hint": "格式 platform:MessageType:session_id，如 QQ:GroupMessage:123456789；也可填 \"*\" 表示所有群。留空 = 不工作（只打分不触发的 dry-run 也要填）"
+    "hint": "格式 platform:MessageType:session_id，如 QQ:GroupMessage:123456789；也可填 \"*\" 表示所有群。白名单模式下留空 = 不工作（只打分不触发的 dry-run 也要填）"
+  },
+  "disabled_sessions": {
+    "description": "黑名单：不评估的会话 (UMO)",
+    "type": "list",
+    "default": [],
+    "hint": "仅 session_mode=blacklist 时生效；填 \"*\" 表示全禁。适合「只屏蔽某几个群、其余全开」的场景"
   },
   "api_key": {
     "description": "TypeSafe API Key",
@@ -14,8 +27,14 @@
   "model": {
     "description": "Jev 模型 ID",
     "type": "string",
-    "default": "jev-1.13.0",
-    "hint": "建议钉版本号而不用 latest 别名：阈值是按具体版本调的，别名升级可能让判定漂移"
+    "default": "jev-latest",
+    "hint": "默认跟随官方最新版。注意 jev-latest 会随官方更新漂移，阈值是按具体版本调的——若发现提名质量变化，先钉一个具体版本号（如 jev-1.13.0）再对比账本"
+  },
+  "jev_provider_url": {
+    "description": "Jev API 地址",
+    "type": "string",
+    "default": "https://api.typesafe.ai/v1/systemone",
+    "hint": "默认官方端点。可填自建代理或中转渠道（须兼容同一 /v1/systemone 接口格式）；留空回退官方"
   },
   "persona": {
     "description": "bot 人设描述（发给 Jev 当背景）",
@@ -24,16 +43,22 @@
     "hint": "写清 bot 的名字/群里常用称呼、性格、常聊话题。Jev 靠这段判断“这条消息是不是在说它”，写得越具体越准。{self_id} 会自动替换成本次消息所属 bot 的账号。留空用内置通用文案"
   },
   "questions": {
-    "description": "评估问题定义（JSON）",
+    "description": "评估问题定义（高级配置）",
     "type": "text",
     "default": "{\n  \"is_mentioned\": {\n    \"type\": \"noul\",\n    \"instructions\": \"目标消息是否在点名 QQ {self_id} 或直接对它说话？\",\n    \"criteria\": {\n      \"true\": \"叫了它的名字、群里常用的称呼或昵称，或话头明显是对它说的——包括暗指和含沙射影\",\n      \"false\": \"没有针对它：@其他机器人、@其他群友、或群内普通对话都不算\"\n    }\n  },\n  \"is_answerable\": {\n    \"type\": \"noul\",\n    \"instructions\": \"目标消息是否提出了一个可以回答的问题或请求？\",\n    \"criteria\": {\n      \"true\": \"在提问、求助、征求意见，或抛出了一个可以接的话头\",\n      \"false\": \"陈述、自言自语、表情、复读、纯吐槽无问号\"\n    }\n  },\n  \"is_unanswered\": {\n    \"type\": \"noul\",\n    \"instructions\": \"目标消息提出的问题，在它之前的对话里还没有人回答过？\",\n    \"criteria\": {\n      \"true\": \"之前的消息没有人回答这个问题\",\n      \"false\": \"前面已经有人回答或解决了\"\n    }\n  },\n  \"is_good_moment\": {\n    \"type\": \"noul\",\n    \"instructions\": \"此刻机器人接话是否自然得体？\",\n    \"criteria\": {\n      \"true\": \"对话节奏允许加入，接话不会打断别人正在进行的话题\",\n      \"false\": \"群里正专注聊别的事，或两人对话正浓，插话会尴尬\"\n    }\n  },\n  \"is_persona_fit\": {\n    \"type\": \"noul\",\n    \"instructions\": \"这条消息的话题是否符合机器人的人设，它接话会不会有趣？\",\n    \"criteria\": {\n      \"true\": \"话题与机器人的人设、兴趣或常聊领域相关，或它能给出符合人设的有趣反应\",\n      \"false\": \"话题与人设无关，接话会莫名其妙\"\n    }\n  },\n  \"reply_value\": {\n    \"type\": \"score\",\n    \"instructions\": \"综合来看，机器人主动回复这条消息的价值有多大？\",\n    \"criteria\": [\n      \"不该接：表情、复读、与人设完全无关的闲聊\",\n      \"可接可不接：有点意思但错过也无所谓\",\n      \"值得接：符合人设的问题或话题，且还没人回答\",\n      \"很适合接：点名搭话，或话题正中人设且气氛合适\"\n    ]\n  }\n}",
     "hint": "整段是一个 JSON 对象：键 = 问题 ID（代码里要认，见 README，误删会报错或走默认），值 = {type, instructions, criteria}。type 只有 noul(是否，返回 0-1 概率) 和 score(分级，criteria 是有序数组)。可自由加问题。{self_id} 会自动替换"
+  },
+  "nomination_rule": {
+    "description": "提名规则（高级配置，留空用内置规则）",
+    "type": "text",
+    "default": "",
+    "hint": "布尔表达式，让 questions 里自定义的问题也能参与提名。节点只有三种：{\"any\":[子句...]} 任一成立、{\"all\":[子句...]} 全部成立、{\"<问题ID>\":{\"运算符\":数字}} 叶子。运算符支持 >= > <= < ==。例：{\"any\":[{\"is_mentioned\":{\">=\":0.6}},{\"all\":[{\"reply_value\":{\">=\":1.5}},{\"is_good_moment\":{\">\":0.45}}]}]} 与内置规则等价。留空/写错都自动回退内置规则并告警，不会静默不提名"
   },
   "thresholds": {
     "description": "提名阈值",
     "type": "object",
     "items": {
-      "mention": {
+      "is_mentioned": {
         "description": "is_mentioned 提名线",
         "type": "float",
         "default": 0.6
@@ -43,28 +68,28 @@
         "type": "float",
         "default": 1.5
       },
-      "good_moment": {
-        "description": "good_moment 护栏（须大于此值）",
+      "is_good_moment": {
+        "description": "is_good_moment 护栏（须大于此值）",
         "type": "float",
         "default": 0.45
       },
-      "answerable": {
+      "is_answerable": {
         "description": "is_answerable 参考线（不参与提名）",
         "type": "float",
         "default": 0.6
       },
-      "unanswered": {
+      "is_unanswered": {
         "description": "is_unanswered 参考线（不参与提名）",
         "type": "float",
         "default": 0.6
       },
-      "persona_fit": {
+      "is_persona_fit": {
         "description": "is_persona_fit 参考线（不参与提名）",
         "type": "float",
         "default": 0.55
       }
     },
-    "hint": "提名条件：is_mentioned >= mention，或（reply_value >= reply_value 且 is_good_moment > good_moment）。写进 Jev 的问题 ID 才有阈值可调"
+    "hint": "键 = Jev 问题 ID，与上面的「评估问题定义」一一对应。这三个阈值驱动内置提名规则（nomination_rule 留空时生效）：is_mentioned >= is_mentioned，或（reply_value >= reply_value 且 is_good_moment > is_good_moment）；填了自定义规则后数字就写在规则里，此处不再参与"
   },
   "context_window": {
     "description": "评估时附带的历史消息条数",
@@ -74,27 +99,56 @@
     "hint": "越大越准也越贵（token 按输入计费）。一般 10-20 够用"
   },
   "other_bot_ids": {
-    "description": "群里其他机器人的账号",
+    "description": "防止 bot 之间刷屏：群里其他机器人的账号",
     "type": "list",
     "default": [],
-    "hint": "用于在上下文里标注“这条是别的机器人说的”。是否评估它们由下一项决定"
+    "hint": "提醒 Jev 注意这些账号是机器人：上下文里它们的发言会标注成「xxx(机器人)」，引用它们的消息也不会抢答"
   },
   "evaluate_other_bots": {
-    "description": "是否也评估其他机器人发的消息",
+    "description": "直接无视其他 bot 的发言（不评估）",
     "type": "bool",
-    "default": false
+    "default": false,
+    "hint": "false（默认）= 直接无视：不评估、不触发，但上下文里仍标注为机器人供 Jev 看全场；true = 照常评估它们发的消息（可能接 bot 的话，慎用）"
+  },
+  "skip_directed_messages": {
+    "description": "@ 指向别人的消息不接话",
+    "type": "bool",
+    "default": true,
+    "hint": "消息 @ 了任何其他账号（含 @全体）、或引用了其他 bot 的消息时，视为别人点的对话，不评估不触发。关掉后这些消息会交给 Jev 正常评估（可能抢答）"
   },
   "cooldown_minutes": {
     "description": "两次主动触发的间隔下限（分钟）",
     "type": "int",
     "default": 30,
-    "minimum": 0
+    "minimum": 0,
+    "hint": "0 = 关闭冷却；也可用下面的 cooldown_enabled 开关。连续对话场景见 followup_cooldown_seconds"
+  },
+  "cooldown_enabled": {
+    "description": "启用冷却",
+    "type": "bool",
+    "default": true,
+    "hint": "关掉后任何提名通过日限就直接触发（群里刷屏风险自负）；cooldown_minutes=0 等效关闭"
+  },
+  "followup_cooldown_seconds": {
+    "description": "连续对话短冷却（秒）",
+    "type": "int",
+    "default": 0,
+    "minimum": 0,
+    "hint": "0 = 连续对话窗口内同一发送者的提名直接放行（推荐）。设为 60 之类的值可防止回复还在生成时用户连发导致连回两条"
+  },
+  "followup_window_minutes": {
+    "description": "连续对话判定窗口（分钟）",
+    "type": "int",
+    "default": 10,
+    "minimum": 1,
+    "hint": "bot 上次回复某发送者后，该发送者在此窗口内的发言视为「接着聊」，走短冷却；窗口外仍按长冷却"
   },
   "daily_limit": {
     "description": "每个会话每天最多主动触发几次",
     "type": "int",
     "default": 5,
-    "minimum": 0
+    "minimum": 0,
+    "hint": "拒答不计数：bot 输出 [PASS] 时会退还"
   },
   "max_daily_evaluations": {
     "description": "每个会话每天最多评估几条消息（防失控烧钱）",
@@ -104,16 +158,29 @@
     "hint": "纯成本护栏。单次评估约 $0.0001，300 条约 $0.03/天"
   },
   "dry_run": {
-    "description": "dry-run（只打分记录，不触发回复）",
+    "description": "只审计模式",
     "type": "bool",
-    "default": true,
-    "hint": "建议第一次装完保持开启，跑几天看账本，确认提名质量再关掉"
+    "default": false,
+    "hint": "用于测试触发质量，开启后主动回复将不会生效；建议让你的agent来评估质量：\n~\\.astrbot\\data\\plugin_data\\jev_gate"
   },
   "trigger_notice": {
     "description": "触发提醒（随触发请求一起发给 bot）",
     "type": "text",
     "default": "<system>\n上面是一条没有 @ 你的群消息。门控模型评估认为它可能值得你接话，参考原因：{reason}。\n如果以你对群里氛围和话题的了解，判断不值得回应，只输出 [PASS]；\n否则就用你平时在群里的方式直接回应。\n</system>",
     "hint": "可用占位符只有 {reason}（提名原因）。这段只对本次请求可见，不会写进对话历史。人格/对话历史/群历史都由 AstrBot 主线装配，不在这里配置"
+  },
+  "pass_history_mode": {
+    "description": "拒答 [PASS] 是否留在历史里",
+    "type": "string",
+    "default": "keep",
+    "options": ["keep", "hide"],
+    "hint": "keep：拒答照常落库，模型之后能看见自己曾经 [PASS] 过（可能强化它输出 [PASS] 的倾向）；hide：守卫清空时把刚落库的拒答记录从群消息历史和会话历史里删掉，模型完全不知道自己曾经拒答过"
+  },
+  "refusal_fuzzy_match": {
+    "description": "拒答宽松匹配",
+    "type": "bool",
+    "default": false,
+    "hint": "关闭时整条回复必须恰好是 [PASS]/[pass]/[不回复]（容忍首尾空白和句读）才算拒答；开启后本插件触发轮改为包含匹配——整条里出现 token 就算拒答。普通回复始终精确匹配，避免误伤"
   },
   "jev_timeout_seconds": {
     "description": "Jev 单次评估超时（秒）",

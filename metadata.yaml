@@ -4,7 +4,7 @@ short_desc: 用 Jev 模型给群聊消息打分，只在真值得接话时才触
 desc: |
   把群消息交给 TypeSafe Jev 模型打分，
   按阈值判断"值得接话"的消息，再在 AstrBot 管线内触发一次主动回复。
-version: 0.3.3
+version: 0.3.4
 author: terk
 repo: https://github.com/Sodapopper-pixel/astrbot_plugin_jev_gate
 astrbot_version: ">=4.25.0"

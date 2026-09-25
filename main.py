@@ -20,10 +20,13 @@
 了其他 bot 的消息时, 视为"别人点的对话", 不评估不触发——Jev 的 is_mentioned
 分得清"不是说我", 但 value 提名路径不看指向, 所以这活只能代码规则干。
 
-冷却可关(cooldown_enabled=false 或 cooldown_minutes=0); 开启时同一发送者
-在 followup 窗口内接着聊走 followup_cooldown_seconds 短冷却(默认 0 = 直接
-放行), 不影响对其他人插话的长冷却。bot 输出 [PASS] 拒答时, 冷却与日限会被
-退还(99990 守卫里回退), "触发了但没说话"不再隐形消耗额度。
+冷却**默认关闭**(cooldown_enabled=false, cooldown_minutes=0 等效); 开启时
+同一发送者在 followup 窗口内接着聊走 followup_cooldown_seconds 短冷却(默认
+0 = 直接放行), 不影响对其他人插话的长冷却。⚠️ followup_window_minutes=0 的
+含义是"**不限窗口**"(同一发送者永远算接着聊), 不是"窗口 0 秒"——后者会让
+is_followup 永假, 本想放宽限制反被 30 分钟长冷却拦死(2026-09-25 实测踩坑)。
+bot 输出 [PASS] 拒答时, 冷却与日限会被退还(99990 守卫里回退), "触发了但
+没说话"不再隐形消耗额度。
 
 拒答历史(pass_history_mode): keep(默认)= [PASS] 照常落库, 模型之后能看见
 自己曾经拒答过; hide = 守卫清空时把刚落库的拒答记录从群消息历史和会话历史
@@ -552,6 +555,8 @@ class JevGatePlugin(Star):
                 "prev_dispatch_ts": 0.0,
                 "prev_dispatch_sender": "",
                 "trigger_sender": "",
+                # 日评估上限命中告警只喊一次(按会话+日期去重)
+                "eval_cap_logged": "",
             }
             self._sessions[umo] = st
         return st
@@ -710,6 +715,11 @@ class JevGatePlugin(Star):
                 "ts": time.time(), "kind": "directed_skip", "session": umo,
                 "sender": sender_name, "content": text, "aimed_at": aimed_at,
             })
+            logger.info(
+                f"[JevGate] 跳过评估(directed_skip): {sender_name}: "
+                f"{text[:40]} | aimed_at={aimed_at} "
+                f"skip_directed_messages=True"
+            )
             return
         if _SKIP_TEXT_RE.match(text):
             return
@@ -726,9 +736,19 @@ class JevGatePlugin(Star):
         # ── Layer 0: 日评估上限(计数器只加锁操作, Jev 调用本身不持锁) ──
         today = self._today()
         async with st["lock"]:
-            if st["daily"].get(today, 0) >= int(self._cfg("max_daily_evaluations", 400)):
+            eval_cap = int(self._cfg("max_daily_evaluations", 400))
+            used = st["daily"].get(today, 0)
+            if used >= eval_cap:
+                # 命中后每条消息都会走到这, 日志按"会话+日期"只喊一次
+                if st.get("eval_cap_logged") != today:
+                    st["eval_cap_logged"] = today
+                    logger.info(
+                        f"[JevGate] 本会话今日评估已达上限, 停止评估: {umo} | "
+                        f"max_daily_evaluations={eval_cap} used={used} "
+                        f"date={today}"
+                    )
                 return
-            st["daily"][today] = st["daily"].get(today, 0) + 1
+            st["daily"][today] = used + 1
 
         # ── Layer 1: Jev 提名(上下文排除目标消息本身, 与评估数据形态一致) ──
         ts = time.time()
@@ -783,36 +803,56 @@ class JevGatePlugin(Star):
             return
 
         # ── 冷却 / 每日触发上限 (只约束"真的要行动"的路径) ──
-        # cooldown_enabled=false 或 cooldown_minutes=0 时完全关闭冷却;
+        # cooldown_enabled=false(默认) 或 cooldown_minutes=0 时完全关闭冷却;
         # 否则同一发送者在 followup 窗口内接着聊走短冷却(默认 0 = 直接放行),
         # 其他人插话仍走长冷却。日限永远是硬上限。
         async with st["lock"]:
-            if self._cfg("cooldown_enabled", True):
-                cooldown = int(self._cfg("cooldown_minutes", 30)) * 60
-                if cooldown > 0:
+            if self._cfg("cooldown_enabled", False):
+                cd_minutes = int(self._cfg("cooldown_minutes", 30))
+                if cd_minutes > 0:
                     now = time.time()
-                    is_followup = (
-                        sender_id == st.get("last_dispatch_sender")
-                        and now - st.get("last_dispatch_ts", 0.0)
-                        < int(self._cfg("followup_window_minutes", 10)) * 60
+                    window_min = int(self._cfg("followup_window_minutes", 10))
+                    followup_s = int(self._cfg("followup_cooldown_seconds", 0))
+                    # window_min<=0 = 不限窗口: 同一发送者永远算"接着聊"。
+                    # 曾经的坑: 0 被当成"窗口 0 秒" → is_followup 永假 →
+                    # 用户本想关掉窗口限制, 反被 30 分钟长冷却拦死。
+                    is_followup = sender_id == st.get("last_dispatch_sender") and (
+                        window_min <= 0
+                        or now - st.get("last_dispatch_ts", 0.0) < window_min * 60
                     )
-                    if is_followup:
-                        cooldown = int(self._cfg("followup_cooldown_seconds", 0))
-                    if now - st["last_nominate"] < cooldown:
+                    cooldown = followup_s if is_followup else cd_minutes * 60
+                    elapsed = now - st["last_nominate"]
+                    if elapsed < cooldown:
                         record["trigger"] = {
                             "choice": "skip", "detail": "cooldown",
                             "followup": is_followup,
+                            "elapsed_s": round(elapsed, 1),
+                            "cooldown_s": cooldown,
                         }
                         self._append_ledger(record)
                         logger.info(
-                            f"[JevGate] 冷却中跳过触发({reason}"
-                            f"{', 连续对话' if is_followup else ''}): "
-                            f"{sender_name}: {text[:40]}"
+                            f"[JevGate] 跳过触发(cooldown): {sender_name}: "
+                            f"{text[:40]} | reason={reason} "
+                            f"followup={is_followup} "
+                            f"elapsed_s={elapsed:.0f} < cooldown_s={cooldown:.0f} "
+                            f"| cooldown_enabled=True cooldown_minutes={cd_minutes} "
+                            f"followup_window_minutes={window_min} "
+                            f"followup_cooldown_seconds={followup_s}"
                         )
                         return
-            if st["nominated"].get(today, 0) >= int(self._cfg("daily_limit", 5)):
-                record["trigger"] = {"choice": "skip", "detail": "daily_limit"}
+            day_limit = int(self._cfg("daily_limit", 5))
+            used_today = st["nominated"].get(today, 0)
+            if used_today >= day_limit:
+                record["trigger"] = {
+                    "choice": "skip", "detail": "daily_limit",
+                    "used": used_today,
+                }
                 self._append_ledger(record)
+                logger.info(
+                    f"[JevGate] 跳过触发(daily_limit): {sender_name}: "
+                    f"{text[:40]} | reason={reason} "
+                    f"used={used_today} >= daily_limit={day_limit} | date={today}"
+                )
                 return
             st["nominated"][today] = st["nominated"].get(today, 0) + 1
             # prev_* 快照供拒答退还: bot 输出 [PASS] 或取不到 conversation 时

@@ -1,6 +1,6 @@
 # AGENTS — astrbot_plugin_jev_gate
 
-Jev 主动回复门控插件（v0.3.3 判断+触发，已发布到 AstrBot 插件市场）。Jev 给群聊消息打分，提名值得主动回复的消息后**在管线内 yield request_llm 触发**——插件不组装 LLM 上下文、不直发消息。
+Jev 主动回复门控插件（v0.3.4 判断+触发，已发布到 AstrBot 插件市场）。Jev 给群聊消息打分，提名值得主动回复的消息后**在管线内 yield request_llm 触发**——插件不组装 LLM 上下文、不直发消息。
 
 - 仓库：https://github.com/Sodapopper-pixel/astrbot_plugin_jev_gate
 - **Jev 实践参考（贡献前先读）**：TypeSafe 官方 Agent Skill `typesafe-ai/skills` — https://github.com/typesafe-ai/skills
@@ -9,7 +9,7 @@ Jev 主动回复门控插件（v0.3.3 判断+触发，已发布到 AstrBot 插�
   - 它把 docs.typesafe.ai 当唯一事实源（纯索引型 skill），API 细节以官方文档实时为准，别信二手转述
 - 作者：terk ｜ 许可：MIT ｜ `astrbot_version: ">=4.25.0"`（依赖 `TextPart.mark_as_temp`）
 
-## 架构要点（v0.3.3）
+## 架构要点（v0.3.4）
 
 - **一层钩子**：`@filter.event_message_type(GROUP_MESSAGE, priority=-2)` 的 **生成器 handler**（`on_group_message`）。**priority=-2 是负载性的**：AstrBot handler 按 priority **降序**执行（`star_handler.py` 的 `sort(key=lambda h: -priority)`），-2 保证排在内置 star 的 `on_message`(0, 群上下文捕获) 和 chat_plus(-1) 之后——改成非负会让主动触发丢掉群聊历史，详见下方踩坑。
 
@@ -24,7 +24,8 @@ Jev 主动回复门控插件（v0.3.3 判断+触发，已发布到 AstrBot 插�
 - **主动触发必须晚于群上下文捕获（2026-09-24 生产实锤）**：内置 star 的 `on_message`(priority=0) 调 `group_chat_context.handle_message(event)`，把本消息写进群上下文缓冲并打 `_group_context_record_id`/`_group_context_raw_idx` 标记；`decorate_llm_req` → `on_req_llm` 靠这两个标记决定注入 `raw_list[:prompt_idx]` 作为群历史。**旧版 priority=500 跑在 on_message 前面**，yield 出的请求标记还不存在 → `on_req_llm` 开头 `if not isinstance(record_id, str) and (prompt_idx < 0): return` 直接早退 → 主动触发的请求**完全没有群聊历史**。日志实锤：主动触发消息的 handler 链里没有 `plugin -> astrbot - on_message`，它要等回复发出后才补跑（`StarRequestSubStage` 的 handler 循环在 yield 后会被 ProcessStage 内联的 agent 子阶段打断，回复完才继续）。连带损伤：未消费的缓冲攒到下次 @ 回复一次性吐出（实测一条 2722 字符、跨 4.5 小时的陈旧上下文块）。修法=priority 改 -2。副作用（正向）：sleep_mode 入站守卫(1)现在跑在前面，休眠群不再浪费 Jev 调用。
 - **为什么指向规则必须代码层**：167 条 @他人的实测消息 Jev 的 is_mentioned 全部 ≤0.5（它分得清"不是说我"），但 **value 提名路径压根不看指向**——60+ 条 @他人的消息被提名、5 条真实 dispatch（含 @普通群友问技术问题被抢答）。指望调阈值/改 criteria 堵不住这条路。
 - **other_bot_ids 的两个用途**（v0.3.1 修复了第一个从未生效的问题）：① 上下文标注——其他 bot 的发言进缓冲时打 `is_bot`，Jev 渲染时显示 `name(机器人)`（旧版在进缓冲前就 return，标注是死代码）；② 引用判定——引用它们的消息算 bot 间对话不抢答。是否评估它们发的消息由 `evaluate_other_bots` 决定（默认 false，但**仍进缓冲**）。
-- **冷却语义（v0.3.1 改）**：`cooldown_enabled=false` 或 `cooldown_minutes=0` 完全关闭；开启时**同一发送者**在 `followup_window_minutes`（默认 10min）内接着说话走 `followup_cooldown_seconds`（默认 0=直接放行）短冷却，其他人插话仍走长冷却。触发时**乐观**记录 `last_dispatch_ts/sender`（不必等回复发出），拒答时守卫回滚快照。
+- **冷却语义（v0.3.4 改）**：`cooldown_enabled` **默认 false**（v0.3.1 曾是 true，生产实测"喊完名字接着聊被 30 分钟墙拦死"），`cooldown_minutes=0` 等效关闭；开启时**同一发送者**在 `followup_window_minutes`（默认 10min）内接着说话走 `followup_cooldown_seconds`（默认 0=直接放行）短冷却，其他人插话仍走长冷却。**⚠️ `followup_window_minutes=0` 的含义是"不限窗口"（同一发送者永远算接着聊），不是"窗口 0 秒"**——后者 `now - last_dispatch_ts < 0` 永假 → `is_followup` 永假 → 本想放宽限制反被长冷却拦死（2026-09-25 用户实测踩坑，故 v0.3.4 改成 `window_min <= 0 or ...`，schema `minimum` 也从 1 放开到 0）。触发时**乐观**记录 `last_dispatch_ts/sender`（不必等回复发出），拒答时守卫回滚快照。
+- **门控命中日志（v0.3.4 新增）**：每次被门控拦下都打 info（搜 `[JevGate] 跳过`），带字段与实测值：cooldown（`reason` + `followup` + `elapsed_s`/`cooldown_s` + 四个冷却配置现值）、daily_limit（`used`/`daily_limit`/`date`）、directed_skip（`aimed_at`/`skip_directed_messages`）、日评估上限（`max_daily_evaluations`/`used`/`date`，**每会话每天只喊一次**——命中后每条消息都走这个分支，不节流会刷屏）。@bot 点名（`mention_code_skip`）和其他 bot 发言属于预期行为，只写账本不打日志。harness 用 `H.reset_logs()` / `H.logs()` 断言这些内容。
 - **提名条件**：留空 `nomination_rule` 时走内置两条路径（`_nominate`，评估实测）：`is_mentioned >= is_mentioned` 或 `reply_value >= reply_value 且 is_good_moment > is_good_moment`，阈值取 `thresholds`。`is_unanswered` 对非问题消息是噪音（全量 mean 0.63），只记账不参与提名。
 - **自定义提名规则**（v0.3.3 `nomination_rule`，text JSON）：`{"any":[子句...]}` / `{"all":[子句...]}` / `{"<问题ID>":{">=":数字}}` 三种节点，运算符白名单 `>= > <= < ==`（`_RULE_OPS`，**不用 eval**）。**这是 questions 自定义问题能参与提名的唯一途径**——否则新问题的值只进账本。三层兜底：留空=内置规则、坏 JSON/结构非法=告警回退内置（绝不静默不提名）、规则引用 questions 里没有的问题 ID=该条件不成立+启动时告警。原因串由实际命中的子句生成（如 `is_urgent(0.75>=0.7)`），落账本可追溯。按原始字符串缓存，配置没变不重复解析。
 - **Jev 调用超时**：`_call_jev` 外层 `asyncio.wait_for(jev_timeout_seconds=25)`。Jev 实测 p50 1.2s / p90 7s / 极端 191s（重试睡 1+2+4+8s + 4×60s timeout）。调用本身在生成器 handler 内同步 await（评估完才决定 yield 与否），@bot 消息在代码层提前返回、不受影响。
@@ -34,7 +35,7 @@ Jev 主动回复门控插件（v0.3.3 判断+触发，已发布到 AstrBot 插�
 
 - `self._sessions[umo]`：`buffer`(deque, maxlen = context_window+5，供 Jev 看全场) + asyncio.Lock（**只保护计数器**，Jev HTTP 不持锁）+ daily/nominated 计数 + last_nominate + `last_dispatch_ts/sender`（对话连续性：bot 上次触发/回复的发送者，触发时乐观写、拒答回滚）+ `prev_*` 快照（拒答退还用）。**热重载丢缓冲与计数**（账本不丢）。
 - `self._persona_cache[self_id]` / `_questions_for`：`{self_id}` 占位符按事件替换（一个实例服务多平台）。
-- 账本：`StarTools.get_data_dir("jev_gate")/ledger_YYYYMMDD.jsonl`（即 `data/plugin_data/jev_gate/`）。`kind`：`mention_code_skip` / `directed_skip`（带 `aimed_at`）/ `evaluated` / `error`；`trigger` 字段：`dry_run` / `skip(cooldown|daily_limit|no_conversation)` / `dispatch`（带 `conversation` 前缀便于和 DB 对账）。cooldown skip 带 `followup: true/false` 区分长短冷却。
+- 账本：`StarTools.get_data_dir("jev_gate")/ledger_YYYYMMDD.jsonl`（即 `data/plugin_data/jev_gate/`）。`kind`：`mention_code_skip` / `directed_skip`（带 `aimed_at`）/ `evaluated` / `error`；`trigger` 字段：`dry_run` / `skip(cooldown|daily_limit|no_conversation)` / `dispatch`（带 `conversation` 前缀便于和 DB 对账）。cooldown skip 带 `followup: true/false` 区分长短冷却 + `elapsed_s`/`cooldown_s` 实测值，daily_limit skip 带 `used`。**日志与账本是两套可见性**：门控命中必有 info 日志（字段+值），@bot 点名/其他 bot 发言只进账本。
 - `initialize()`：启动自检，打一行「会话/dry_run/api_key/model」状态，并在 `enabled_sessions` 为空、`persona` 未配置、`questions` 缺关键 ID 时告警。"装了没反应"先看这行。
 
 ## 配置层（v0.3.0 改版，面向市场用户）
@@ -49,7 +50,8 @@ Jev 主动回复门控插件（v0.3.3 判断+触发，已发布到 AstrBot 插�
 
 - **`[PASS]` 泄露到群里（2026-09-24 生产实锤）**：用户 @bot 的消息模型直接回复了 `[PASS]`（08:26 连发两条），旧守卫只处理带触发标记的轮次所以没拦。根因侧写：persona 的 `<no_reply>` 段只教了 `[不回复]`，`[PASS]` 是 jev_gate 私有契约——模型混用两个 token。修复=守卫扩到所有 LLM 回复。教训：**任何"模型输出约定 token"都必须有覆盖全部回复路径的出站守卫**，不能只守自己触发的那一条。
 - **@他人的消息被真实 dispatch（2026-09-24 账本实锤）**：`other_bot_ids` 为空时，群里其他 bot（织羽酱/九曜）的消息按人类评估，reply_value 路径提名并触发——既浪费冷却/日限，又让 bot 去接其他 bot 的话。同批数据里还有 @普通群友问技术问题被抢答的 dispatch。167 条 @他人消息的 is_mentioned 全部 ≤0.5 证明 Jev 分得清指向，是 value 路径不看指向。群里其他 bot 的 QQ 号可从日志 `sender=AIxxx(QQ号)` 或消息 `[At:QQ号]` 反查；引用消息的作者读 `Reply.sender_id`（`aiocqhttp_platform_adapter.py` 构造引用段时填）。
-- **冷却拦得住"喊名字接着聊"（2026-09-24 账本实锤）**：「弥音在不」dispatch 后 137 秒的「帮我看看grok4.7的情况」提名 0.82 达标却被 30 分钟冷却 skip。全局冷却对"正在进行的对话"是误伤——v0.3.1 起同发送者窗口内放行。**判定层没问题先查账本的 `trigger.detail`，别去调阈值**。- **thresholds 键集硬编码 vs questions 可自由扩展的矛盾（v0.3.3 解法）**：`check_config_integrity`（astrbot_config.py:167）每次加载都按 schema 逐键比对，`conf` 有而 `refer`（schema）没有的键**直接删掉**（实测日志只有一行 INFO `Config key removed: thresholds.xxx`）——所以 `object`+`items` 的键集被 schema 钉死，用户无法给自定义问题配阈值；而 `text` 是不透明叶子值，里面写什么都不管。曾想加 `custom_thresholds`(text) 合并，但单独做没意义：**阈值只有三个键被 `_nominate` 读，自定义问题的阈值是死配置**。最终解法是让提名规则本身可配置（`nomination_rule`），数字直接写在规则里，单一事实源。
+- **冷却拦得住"喊名字接着聊"（2026-09-24 账本实锤，v0.3.4 起默认关）**：「弥音在不」dispatch 后 137 秒的「帮我看看grok4.7的情况」提名 0.82 达标却被 30 分钟冷却 skip。全局冷却对"正在进行的对话"是误伤——v0.3.1 起同发送者窗口内放行，v0.3.4 起干脆默认关闭。**判定层没问题先查账本的 `trigger.detail` 或日志的 `[JevGate] 跳过`，别去调阈值**。
+- **thresholds 键集硬编码 vs questions 可自由扩展的矛盾（v0.3.3 解法）**：`check_config_integrity`（astrbot_config.py:167）每次加载都按 schema 逐键比对，`conf` 有而 `refer`（schema）没有的键**直接删掉**（实测日志只有一行 INFO `Config key removed: thresholds.xxx`）——所以 `object`+`items` 的键集被 schema 钉死，用户无法给自定义问题配阈值；而 `text` 是不透明叶子值，里面写什么都不管。曾想加 `custom_thresholds`(text) 合并，但单独做没意义：**阈值只有三个键被 `_nominate` 读，自定义问题的阈值是死配置**。最终解法是让提名规则本身可配置（`nomination_rule`），数字直接写在规则里，单一事实源。
 - **Jev 的 state 不是单条消息**：`recent_conversation`（context_window 条，排除目标消息本身）+ `bot_persona` + `target_message`。is_unanswered 的前提来自这个窗口，窗口外的更早回答看不见。
 - **@检测初版把"@其他机器人"误判成点名**（0.94）：必须在 persona 里钉死 QQ 号+名字、criteria 里写"@其他机器人不算"。多 bot 群必配 `other_bot_ids`。
 - **暗指名（"昨天哪个AI在刷屏"）不能自动回**：Jev 给 0.4-0.6 中间值，误发=群里社死。提名后走主线问一嘴，bot 在自有上下文里判断是不是说自己。
@@ -65,7 +67,7 @@ Jev 主动回复门控插件（v0.3.3 判断+触发，已发布到 AstrBot 插�
 
 ## 配置速查
 
-`session_mode`(whitelist|blacklist) / `enabled_sessions`(白名单，UMO 列表或 `"*"`) / `disabled_sessions`(黑名单) / `api_key` / `model`(默认 jev-latest) / `jev_provider_url`(默认官方) / `persona`(text) / `questions`(text=JSON) / `nomination_rule`(text=JSON，空=内置) / `thresholds`(object+items) / `context_window`(15) / `other_bot_ids`(标注+引用判定) / `evaluate_other_bots`(false) / `skip_directed_messages`(true) / `cooldown_minutes`(30) / `cooldown_enabled`(true) / `followup_window_minutes`(10) / `followup_cooldown_seconds`(0) / `daily_limit`(5) / `max_daily_evaluations`(300) / `dry_run`(true) / `jev_timeout_seconds`(25) / `trigger_notice`（仅 `{reason}` 占位符）/ `pass_history_mode`(keep|hide) / `refusal_fuzzy_match`(false)
+`session_mode`(whitelist|blacklist) / `enabled_sessions`(白名单，UMO 列表或 `"*"`) / `disabled_sessions`(黑名单) / `api_key` / `model`(默认 jev-latest) / `jev_provider_url`(默认官方) / `persona`(text) / `questions`(text=JSON) / `nomination_rule`(text=JSON，空=内置) / `thresholds`(object+items) / `context_window`(15) / `other_bot_ids`(标注+引用判定) / `evaluate_other_bots`(false) / `skip_directed_messages`(true) / `cooldown_minutes`(30) / `cooldown_enabled`(**false**，v0.3.4 起默认关) / `followup_window_minutes`(10，**0=不限窗口**) / `followup_cooldown_seconds`(0) / `daily_limit`(5) / `max_daily_evaluations`(300) / `dry_run`(false) / `jev_timeout_seconds`(25) / `trigger_notice`（仅 `{reason}` 占位符）/ `pass_history_mode`(keep|hide) / `refusal_fuzzy_match`(false)
 
 ## 发布要点（AstrBot 插件市场）
 

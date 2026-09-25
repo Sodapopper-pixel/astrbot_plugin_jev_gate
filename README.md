@@ -6,7 +6,8 @@
 - **可控**：人设、判断问题、提名规则、阈值全可配
 - **不越权**：只做"判断 + 触发"，人格/对话历史/分段/落库全部交给 AstrBot 主线，主动回复和普通回复走同一条管线
 - 内置 dry-run 只审计模式：只打分写账本，确认提名质量后再开启实发
-- 冷却时间（可关）、每日触发上限、每日评估上限三重护栏
+- 冷却时间（默认关，可开）、每日触发上限、每日评估上限三重护栏
+- 每次被门控拦下都打 info 日志，带上配置字段与实测值，不用翻账本
 - 触发时会把提名原因告知 bot，可自行拒绝（输出 [PASS]，拒答不消耗冷却和日限）
 - 使用需要自备 TypeSafe API Key（https://console.typesafe.ai/keys）。
 
@@ -42,7 +43,7 @@ Jev 是 System One 模型：不生成文字，只回答你定义好的结构化�
        填了 nomination_rule 就按自定义布尔表达式求值
          │
          ▼
-  Layer 2 触发（通过冷却与每日上限后）
+  Layer 2 触发（通过每日上限，和可选的冷却之后）
        yield event.request_llm(prompt=这条消息, conversation=该会话当前对话)
          │
          ▼
@@ -98,9 +99,9 @@ Jev 是 System One 模型：不生成文字，只回答你定义好的结构化�
 | `other_bot_ids` | `[]` | **防止 bot 之间刷屏**：群里其他机器人的账号。作用是提醒 Jev 注意这些账号是机器人——上下文里它们的发言标注为「机器人」，引用它们的消息也不会抢答 |
 | `evaluate_other_bots` | `false` | **直接无视**其他 bot 的发言：不评估、不触发，但上下文里仍标注为机器人供 Jev 看全场。`true` = 照常评估（可能接 bot 的话，慎用） |
 | `skip_directed_messages` | `true` | @ 指向别人的消息不接话：消息 @ 了任何其他账号（含 @全体）、或引用了其他 bot 的消息时跳过。关掉则交还 Jev 评估（可能抢答） |
-| `cooldown_minutes` | `30` | 两次主动触发的最小间隔（对"接着聊"无效，见下一行） |
-| `cooldown_enabled` | `true` | 总开关。`false`（或 `cooldown_minutes=0`）完全关闭冷却 |
-| `followup_window_minutes` | `10` | 连续对话判定窗口：bot 刚回复过的发送者，在此窗口内继续说话算"接着聊" |
+| `cooldown_minutes` | `30` | 两次主动触发的最小间隔（对"接着聊"无效，见下一行）。仅在 `cooldown_enabled=true` 时生效 |
+| `cooldown_enabled` | `false` | 冷却总开关。**默认关**：提名通过日限就直接触发，连续对话不会再被冷却墙拦。开启后仅约束主动触发频率，@点名回复不受影响；真正的上限是 `daily_limit`（默认 5 次/会话/天）。`cooldown_minutes=0` 等效关闭 |
+| `followup_window_minutes` | `10` | 连续对话判定窗口：bot 刚回复过的发送者，在此窗口内继续说话算"接着聊"，走 `followup_cooldown_seconds` 短冷却。**`0` = 不限窗口**（同一发送者永远算接着聊，不是"窗口 0 秒"——后者会反被长冷却拦死） |
 | `followup_cooldown_seconds` | `0` | "接着聊"时的短冷却。`0` = 窗口内同一发送者的提名直接放行；设为 60 之类可防回复还在生成时用户连发导致连回两条 |
 | `daily_limit` | `5` | 每个会话每天最多触发几次（拒答不计数，会退还） |
 | `max_daily_evaluations` | `300` | 每个会话每天最多评估几条（纯成本护栏，约 $0.03/天） |
@@ -203,16 +204,32 @@ Jev 是 System One 模型：不生成文字，只回答你定义好的结构化�
 | `nouls` | 各 noul 问题的原始概率 |
 | `reply_value` | 分值 / 各级概率 / 置信度 |
 | `nominated` / `reason` | 是否提名、按哪条规则提名 |
-| `trigger` | `dry_run`（只记录）/ `skip`（冷却或日限）/ `dispatch`（已触发） |
+| `trigger` | `dry_run`（只记录）/ `skip`（冷却或日限，附 `elapsed_s`/`cooldown_s`/`used` 实测值）/ `dispatch`（已触发） |
 | `usage` / `latency_s` / `model` | token 用量、耗时、模型版本 |
 
 调优建议：
 
 - **提名太多**：先看是不是人设太泛（补"不接什么"），再考虑把 `thresholds.reply_value` 从 1.5 提到 1.8-2.0
 - **提名太少**：先确认 `is_mentioned` 在真实点名消息上的概率（通常 >0.9），若正常就适当下调 `thresholds.is_mentioned` 或 `thresholds.reply_value`（填了 `nomination_rule` 时改规则里的数字）
-- **反复接同一话题**：调大 `cooldown_minutes`（注意它管不了"接着聊"——那种场景本来就该接）
-- **喊完名字接着聊却被冷场**：确认 `followup_window_minutes` 够长（默认 10 分钟）；窗口外才走长冷却
+- **反复接同一话题**：把 `cooldown_enabled` 打开再调大 `cooldown_minutes`（注意它管不了"接着聊"——那种场景本来就该接）
+- **喊完名字接着聊却被冷场**：默认冷却就是关的，不该出现；若你开了冷却，确认 `followup_window_minutes` 够长（默认 10 分钟），或直接设 `0` = 不限窗口
 - **成本**：`usage` 字段可以直接累加算出真实花费；`max_daily_evaluations` 是硬上限
+
+### 门控命中日志
+
+每次被门控拦下都会打一条 **info** 日志（AstrBot 日志里搜 `[JevGate] 跳过`），带上**命中哪个门控、相关配置字段与实测值**，不用翻账本也知道为什么没回：
+
+```
+[JevGate] 跳过触发(cooldown): 空气: 这玩意咋整 | reason=value(2.00)+moment(0.60) followup=False elapsed_s=137 < cooldown_s=1800 | cooldown_enabled=True cooldown_minutes=30 followup_window_minutes=10 followup_cooldown_seconds=0
+[JevGate] 跳过触发(daily_limit): 空气: 弥音在不 | reason=possible_mention(0.97) used=5 >= daily_limit=5 | date=2026-09-25
+[JevGate] 跳过评估(directed_skip): 裁缝: [At:2384303423]看看这个 | aimed_at=2384303423 skip_directed_messages=True
+[JevGate] 本会话今日评估已达上限, 停止评估: QQ:GroupMessage:756741478 | max_daily_evaluations=300 used=300 date=2026-09-25
+```
+
+- `cooldown` 行给出 `elapsed_s`（距上次触发过了多久）和实际生效的 `cooldown_s`，以及四个冷却配置的当前值——`followup=True` 说明走了连续对话短冷却
+- `daily_limit` 行给出当日已用次数和上限
+- 日评估上限命中后每条消息都会走到那个分支，所以它的日志**每个会话每天只打一次**
+- @bot 点名和其他 bot 发言属于预期行为，只写账本不打日志，避免刷屏
 
 ## 常见问题
 
@@ -220,7 +237,7 @@ Jev 是 System One 模型：不生成文字，只回答你定义好的结构化�
 依次检查：`enabled_sessions` 是否填对（UMO 必须完全一致）→ `api_key` 是否填了 → 插件是否已重载 → 看 `ledger_*.jsonl` 里有没有 `evaluated` 记录。启动日志那行自检会直接告诉你缺哪项。
 
 **dry_run 关了还是没主动发言？**
-看账本里 `nominated: true` 的条目有没有 `trigger: skip`——冷却（`detail: cooldown`，带 `followup` 标记区分长短冷却）和 `daily_limit` 都会拦下触发。另外 qq_official 平台的群主动消息会被平台拒绝（见下）。
+先在日志里搜 `[JevGate] 跳过`——冷却、日限、@指向别处、日评估上限每次命中都会打 info 日志并带上配置值与实测值。也可以看账本里 `nominated: true` 的条目有没有 `trigger: skip`（`detail: cooldown` 带 `followup` 标记区分长短冷却，`daily_limit` 是日限）。另外 qq_official 平台的群主动消息会被平台拒绝（见下）。
 
 **主动回复没进对话历史 / 结尾带句号？**
 本插件不会直发消息，触发一律走主线管线，所以分段、落库、占位符都由 AstrBot 负责。如果你看到没走管线的回复，说明配置里还有别的插件在用 `context.send_message()` 直发。
@@ -257,7 +274,7 @@ D:/AstrBot/backend/python/python.exe -m py_compile main.py
 ```bash
 cd jeval
 D:/AstrBot/backend/python/python.exe test_plugin_harness.py      # 全链路：配置/白名单/上下文/提名/冷却/守卫
-D:/AstrBot/backend/python/python.exe test_v031_fixes.py          # 修复项：@指向/冷却/拒答守卫/历史清理
+D:/AstrBot/backend/python/python.exe test_v031_fixes.py          # 修复项：@指向/冷却/拒答守卫/历史清理/门控日志
 D:/AstrBot/backend/python/python.exe test_nomination_rule.py     # 提名规则引擎：等价性/回退/运算符
 
 # test_plugin_harness 会打真实 Jev API，需带 key：

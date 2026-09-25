@@ -2,6 +2,15 @@
 
 本项目遵循语义化版本。`0.x` 期间次要版本可能包含配置格式变更，升级前请留意对应条目。
 
+## 0.3.4 — 2026-09-25
+
+**修复 `followup_window_minutes=0` 反被长冷却拦死 + 冷却默认关 + 门控命中日志**
+
+- **`followup_window_minutes=0` 的语义从"窗口 0 秒"改为"不限窗口"**：旧代码 `now - last_dispatch_ts < window_min * 60` 在窗口为 0 时永假 → `is_followup` 永假 → 用户本想关掉窗口限制，反被 30 分钟长冷却拦死（生产实测：设 0 后仍然撞冷却墙）。现在 `window_min <= 0` 直接判定为"接着聊"走短冷却；schema 的 `minimum` 也从 1 放开到 0
+- **`cooldown_enabled` 默认值 `true` → `false`**：连续对话场景下全局冷却误伤太多（实测 137 秒间隔的合法后续对话被 30 分钟墙拦下，而 Jev 提名分 0.82 已达标）。默认关后提名通过 `daily_limit`（默认 5 次/会话/天）就直接触发；想要频率约束再手动打开，@点名回复不受影响
+- **每次门控命中都打 info 日志，带配置字段与实测值**（日志里搜 `[JevGate] 跳过`）：cooldown 行给出 `reason`/`followup`/`elapsed_s`/`cooldown_s` 与四个冷却配置现值；daily_limit 行给出 `used`/上限/日期；directed_skip 行给出 `aimed_at`；日评估上限行给出上限与已用数（每会话每天只喊一次——命中后每条消息都走这个分支，不节流会刷屏）。账本 `trigger=skip` 同步补 `elapsed_s`/`cooldown_s`/`used`
+- 测试：`jeval/test_v031_fixes.py` 新增 B6（窗口 0 = 不限窗口）/ B7（缺省键时默认关）/ E 节（四类门控日志的字段与值断言）
+
 ## 0.3.3 — 2026-09-24
 
 **新增 `nomination_rule`：提名规则可配置，自定义问题从此能参与提名**

@@ -126,8 +126,8 @@
   "cooldown_enabled": {
     "description": "启用冷却",
     "type": "bool",
-    "default": true,
-    "hint": "关掉后任何提名通过日限就直接触发（群里刷屏风险自负）；cooldown_minutes=0 等效关闭"
+    "default": false,
+    "hint": "默认关：提名通过日限就直接触发，连续对话不会再被冷却墙拦。开启后仅约束主动触发频率，@点名回复不受影响；真正的上限是 daily_limit（默认 5 次/会话/天）。cooldown_minutes=0 等效关闭"
   },
   "followup_cooldown_seconds": {
     "description": "连续对话短冷却（秒）",
@@ -140,8 +140,8 @@
     "description": "连续对话判定窗口（分钟）",
     "type": "int",
     "default": 10,
-    "minimum": 1,
-    "hint": "bot 上次回复某发送者后，该发送者在此窗口内的发言视为「接着聊」，走短冷却；窗口外仍按长冷却"
+    "minimum": 0,
+    "hint": "bot 上次回复某发送者后，该发送者在此窗口内的发言视为「接着聊」，走短冷却；窗口外仍按长冷却。0 = 不限窗口，同一发送者永远算接着聊（不是「窗口 0 秒」）"
   },
   "daily_limit": {
     "description": "每个会话每天最多主动触发几次",

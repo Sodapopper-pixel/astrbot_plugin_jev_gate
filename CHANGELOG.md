@@ -2,6 +2,16 @@
 
 本项目遵循语义化版本。`0.x` 期间次要版本可能包含配置格式变更，升级前请留意对应条目。
 
+## 未发布
+
+**合并转发展开后再交给 Jev**
+
+- 之前 `_flatten` 把合并转发拉平成 `[Forward]` 占位，Jev 看不到内容，转发的聊天记录几乎不可能被提名（实测一条转发 `reply_value` 0.31、`is_persona_fit` 0.22）
+- 现在对要进缓冲和评估的消息，调用 OneBot `get_forward_msg` 取出转发内容，替换成 `[合并转发]` + 逐行 `昵称: 内容`，账本 `content` 同步记录展开后的文本
+- 复用 AstrBot 主线引用解析用的 `OneBotClient` / `OneBotPayloadParser`（`astrbot.core.utils.quoted_message`，4.25.0 起就有），兼容各 OneBot 实现的返回格式
+- 只展开一层，最多 20 行、2000 字，单次获取超时 5 秒；非 OneBot 平台、调用失败或解析为空时保留 `[Forward]` 占位，行为与旧版一致
+- @bot、指向别处的消息在展开之前就已早退，不会多调 OneBot
+
 ## 0.3.4 — 2026-09-25
 
 **修复 `followup_window_minutes=0` 反被长冷却拦死 + 冷却默认关 + 门控命中日志**

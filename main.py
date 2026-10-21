@@ -70,7 +70,7 @@ from typing import Any
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.message_components import At, Plain, Reply
+from astrbot.api.message_components import At, Forward, Plain, Reply
 from astrbot.api.star import Context, Star
 
 try:  # star_tools 在 core 下; 老版本可能在 api 下, 两者都试
@@ -85,6 +85,13 @@ try:  # TextPart: 触发提醒走 extra_user_content_parts(mark_as_temp 不落�
     from astrbot.core.agent.message import TextPart
 except Exception:  # pragma: no cover
     TextPart = None  # type: ignore[assignment]
+
+try:  # 合并转发展开: 复用主线引用解析的 OneBot 客户端/解析器(4.25 起就有), 取不到就保持 [Forward] 占位
+    from astrbot.core.utils.quoted_message.chain_parser import OneBotPayloadParser
+    from astrbot.core.utils.quoted_message.onebot_client import OneBotClient
+except Exception:  # pragma: no cover
+    OneBotClient = None  # type: ignore[assignment]
+    OneBotPayloadParser = None  # type: ignore[assignment]
 
 TYPESAFE_URL = "https://api.typesafe.ai/v1/systemone"
 # jev_provider_url 的默认值: 官方端点。可换成自建代理/中转渠道(兼容同一
@@ -213,6 +220,11 @@ _JEVGATE_TRIGGER_MARK = "__jevgate_trigger__"
 _REFUSAL_TOKENS = frozenset({"[PASS]", "[pass]", "[不回复]"})
 
 _SKIP_TEXT_RE = re.compile(r"^\s*$")
+
+# 合并转发展开上限: 长聊天记录只取开头, 避免撑大 Jev state、拖慢评估
+_FORWARD_MAX_LINES = 20
+_FORWARD_MAX_CHARS = 2000
+_FORWARD_FETCH_TIMEOUT = 5.0
 
 
 def _now_str(ts: float | None = None) -> str:
@@ -479,6 +491,38 @@ class JevGatePlugin(Star):
             text = (event.get_message_str() or "").strip()
         return text
 
+    async def _expand_forwards(self, event: AstrMessageEvent, text: str) -> str:
+        """把 _flatten 留下的 [Forward] 占位换成转发里的聊天记录。
+
+        只有占位时 Jev 看不到内容, 转发几乎拿不到提名。走 get_forward_msg 取一层,
+        按 _FORWARD_MAX_LINES/_FORWARD_MAX_CHARS 截断; 非 OneBot 平台、调用失败
+        或解析为空时保留占位, 行为与旧版一致。
+        """
+        if OneBotClient is None or "[Forward]" not in text:
+            return text
+        forwards = [c for c in event.get_messages() if isinstance(c, Forward)]
+        if not forwards:
+            return text
+        client = OneBotClient(event)
+        parser = OneBotPayloadParser()
+        for comp in forwards:
+            try:
+                payload = await asyncio.wait_for(
+                    client.get_forward_msg(comp.id), _FORWARD_FETCH_TIMEOUT
+                )
+            except Exception as e:
+                logger.debug(f"[JevGate] 获取合并转发失败, 保留占位: id={comp.id} {e!r}")
+                continue
+            content = parser.parse_get_forward_payload(payload)["text"] if payload else None
+            if not content:
+                continue
+            clipped = "\n".join(content.splitlines()[:_FORWARD_MAX_LINES])[:_FORWARD_MAX_CHARS]
+            if len(clipped) < len(content):
+                clipped += "\n……(转发内容过长, 已截断)"
+            # 换成不同的标记, 多段转发时下一轮 replace 才会命中下一个占位
+            text = text.replace("[Forward]", f"[合并转发]\n{clipped}", 1)
+        return text
+
     def _is_at_bot(self, event: AstrMessageEvent, self_id: str) -> bool:
         for comp in event.get_messages():
             if isinstance(comp, At) and str(comp.qq) == self_id:
@@ -721,6 +765,8 @@ class JevGatePlugin(Star):
                 f"skip_directed_messages=True"
             )
             return
+        # 放在 @bot/指向别处的早退之后: 只对真正要进缓冲和评估的消息多调一次 OneBot
+        text = await self._expand_forwards(event, text)
         if _SKIP_TEXT_RE.match(text):
             return
 

@@ -1,8 +1,9 @@
-"""Jev 主动回复门控插件 (v0.3.0)
+"""Jev 主动回复门控插件 (v0.3.6)
 
 职责边界: 本插件只做**判断与触发**, 不组装 LLM 上下文、不直接发送消息。
 
-  Layer 0  代码规则: 会话白名单 / @bot 检测 / @指向别处不抢答 / 日评估上限
+  Layer 0  代码规则: 会话白名单 / @bot 检测 / @指向别处不抢答 /
+                    戳一戳等通知类消息不评估 / 日评估上限
   Layer 1  Jev 提名:  对非点名消息打分 (多个 Noul 概率 + reply_value),
                       按阈值产出"值得主动回复"的提名及原因
   Layer 2  触发:      提名通过冷却/日限后, yield event.request_llm(
@@ -39,6 +40,40 @@ JSON 布尔表达式就按规则求值, questions 里自定义的问题也能参
 回退内置规则并告警, 绝不静默不提名。规则引用的问题 ID 会与 questions 交叉
 检查, 缺一个喊一次。
 
+接续提名(continuation, v0.3.5): bot 刚回复过的发送者在 followup 窗口内
+接着说话时, 追加一条放宽的提名路径 reply_value >=
+thresholds.continuation_reply_value(默认 1.2)——省略主语/称呼的接话
+("那拔网线")字面无指向, 正常打分过不了 mention/value 两条线(2026-09-25
+实锤: is_mentioned 0.40 / reply_value 1.40 双双落选, 而 18 秒前 bot 刚
+回复过同一人)。nomination_rule 求值时 values 里注入伪值 continuation
+(对话中=1.0 否则 0.0), 自定义规则可写 {"all":[{"continuation":{">=":0.5}},
+{"reply_value":{">=":1.2}}]}。
+
+bot 侧上下文(v0.3.5): bot 真实发出的 LLM 回复经 after_message_sent 钩子
+写进会话缓冲(is_self), Jev 的 recent_conversation 从此看得见对话的 bot
+侧——此前缓冲只有群友消息, _build_state 的 is_self→"(我)" 渲染是死代码,
+模型评省略式接续时不知道 bot 刚说过什么。拒答被清空的轮次不会进
+(RespondStage 对空链早退, 根本不触发该钩子)。LLM 回复标记由本插件
+on_llm_response 自打(__jevgate_llm_reply__), 不再依赖其他插件代打
+__is_llm_reply, 裸装环境守卫与缓冲同样生效。
+
+长度护栏/合并/防抖(v0.3.6):
+- max_message_chars: 单条消息截断后再进评估(state 超 ~32k token 会被 Jev
+  400 拒绝, 且超长条目留在缓冲里会连带同窗口后续评估一起失败; Jev 还有
+  context rot)。完整原文不受影响——群历史由主线独立落库。
+- merge_window_seconds + merge_max_count: 同发送者窗口内的连续消息在发给
+  Jev 的**视图**里合并成一条(碎片化打字连成整段话)。纯渲染层变换, 缓冲
+  本体保持单条, 合并时浅拷贝绝不改原始 dict(防抖按对象身份定位目标条目)。
+- debounce_enabled: 触发前防抖。新问题 is_unfinished(搭并行提问便车, 零
+  额外成本)判断"话是否没说完": 概率低于 debounce_confidence_floor 直接
+  触发, 否则线性映射到 [debounce_min_wait_seconds, debounce_max_wait_seconds]
+  等待——越像没说完等越久。等待期同发送者的新消息被吸收(debounce_absorbed,
+  不再单独评估), 安静期满合并重评一遍完整提名: 否决 → 退款退出
+  (debounce_rejected), 仍提名 → 进下一轮, 最多 _DEBOUNCE_MAX_ROUNDS=3 轮。
+  等待在生成器 handler 内分片 sleep, 不持锁、不起后台任务(热重载安全),
+  其他消息的处理不受影响; @bot 路径完全绕开。防抖标记带 active_until
+  自愈上限, 生成器异常退出也不会把人永久静音。
+
 本插件的 on_group_message 是一个**生成器 handler**: 不提名时零 yield
 直接返回, 提名时 yield 一次 request_llm。绝不 set_result、不 stop_event、
 不调 context.send_message()——后者绕过主线全部后处理(分段/落库/占位符/
@@ -70,7 +105,7 @@ from typing import Any
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.message_components import At, Plain, Reply
+from astrbot.api.message_components import At, Forward, Plain, Poke, Reply
 from astrbot.api.star import Context, Star
 
 try:  # star_tools 在 core 下; 老版本可能在 api 下, 两者都试
@@ -85,6 +120,13 @@ try:  # TextPart: 触发提醒走 extra_user_content_parts(mark_as_temp 不落�
     from astrbot.core.agent.message import TextPart
 except Exception:  # pragma: no cover
     TextPart = None  # type: ignore[assignment]
+
+try:  # 合并转发展开: 复用主线引用解析的 OneBot 客户端/解析器, 取不到就保持 [Forward] 占位
+    from astrbot.core.utils.quoted_message.chain_parser import OneBotPayloadParser
+    from astrbot.core.utils.quoted_message.onebot_client import OneBotClient
+except Exception:  # pragma: no cover
+    OneBotClient = None  # type: ignore[assignment]
+    OneBotPayloadParser = None  # type: ignore[assignment]
 
 TYPESAFE_URL = "https://api.typesafe.ai/v1/systemone"
 # jev_provider_url 的默认值: 官方端点。可换成自建代理/中转渠道(兼容同一
@@ -142,6 +184,16 @@ DEFAULT_QUESTIONS: dict[str, Any] = {
             "false": "话题与人设无关，接话会莫名其妙",
         },
     },
+    # 防抖专用(v0.3.6): 不参与提名, 只驱动触发前的延迟等待。
+    # 概率映射到 debounce 延迟区间: p 越高=越像"话没说完", 等越久再合并重评。
+    "is_unfinished": {
+        "type": "noul",
+        "instructions": "目标消息是否话没说完、发送者很可能马上继续发下一条？",
+        "criteria": {
+            "true": "碎片化表达、话被打断、明显的铺垫或悬置（如'我跟你说''然后呢'），按群聊碎片化打字的常态判断",
+            "false": "完整表达、问题已抛出、有明显收尾语；单纯的短消息不算没说完",
+        },
+    },
     "reply_value": {
         "type": "score",
         "instructions": "综合来看，机器人主动回复这条消息的价值有多大？",
@@ -160,6 +212,9 @@ DEFAULT_THRESHOLDS: dict[str, float] = {
     "is_mentioned": 0.60,  # 暗指点名提名线: 提名后走主线问一嘴, 由 bot 自己判断是不是说自己
     "reply_value": 1.50,   # 综合分提名线
     "is_good_moment": 0.45,  # 护栏(须大于此值)
+    # 接续对话提名线(v0.3.5): bot 刚回复过的发送者在窗口内接着聊时,
+    # reply_value 过这条放宽的线即提名(省略主语的接话字面无指向)
+    "continuation_reply_value": 1.20,
     # 以下仅记录, 不参与提名(实测 AND-gate 全过会过严)
     "is_answerable": 0.60,
     "is_unanswered": 0.60,
@@ -186,6 +241,9 @@ _LEGACY_THRESHOLD_KEYS: dict[str, str] = {
 #
 # 叶子子句 = {"<问题ID>": {"<运算符>": <数字>}}; 问题 ID 可以是 questions 里
 # 任意 noul 问题或 reply_value。运算符白名单, 不做 eval。
+# 求值 values 里还注入伪值 continuation(bot 刚回复过的发送者在窗口内=1.0,
+# 否则 0.0), 供接续对话场景组合, 如 {"all":[{"continuation":{">=":0.5}},
+# {"reply_value":{">=":1.2}}]}。
 _RULE_OPS: dict[str, Any] = {
     ">=": operator.ge,
     ">": operator.gt,
@@ -207,12 +265,21 @@ DEFAULT_TRIGGER_NOTICE = (
 )
 
 _JEVGATE_TRIGGER_MARK = "__jevgate_trigger__"
+# LLM 回复标记: on_llm_response 自打。此前守卫/缓冲依赖 fold_fan_formatter
+# 等"环境插件"代打 __is_llm_reply, 裸装市场用户没有它们时会失效。
+_JEVGATE_LLM_MARK = "__jevgate_llm_reply__"
 
 # 拒答精确匹配: 只认这两个(本插件契约 + 环境既有占位符约定 sleep_mode
 # no_reply_placeholder)。主线出站守卫做匹配, 这里只列白名单, 不做模糊解析。
 _REFUSAL_TOKENS = frozenset({"[PASS]", "[pass]", "[不回复]"})
 
 _SKIP_TEXT_RE = re.compile(r"^\s*$")
+
+# 合并转发展开: 行数上限固定, 字数上限挂 max_message_chars(×4, 关闭时 2000)。
+# 展开文本会进评估上下文与缓冲, 不能旁路长度护栏的口径——否则多条转发
+# 攒在同一个窗口会把 state 推向 32k 硬限(v0.3.6 缓冲投毒的同款风险面)
+_FORWARD_MAX_LINES = 20
+_FORWARD_FETCH_TIMEOUT = 5.0
 
 
 def _now_str(ts: float | None = None) -> str:
@@ -243,7 +310,11 @@ def _validate_rule(node: Any) -> tuple[bool, str]:
 
 
 def _rule_question_ids(node: Any, out: set[str] | None = None) -> set[str]:
-    """收集规则里引用到的所有问题 ID(用于和 questions 配置交叉检查)。"""
+    """收集规则里引用到的所有问题 ID(用于和 questions 配置交叉检查)。
+
+    continuation 是求值时注入的伪值(对话中=1.0), 不是 question, 交叉检查
+    要排除, 否则规则引用它会造成"questions 里不存在"的误告警。
+    """
     if out is None:
         out = set()
     if isinstance(node, dict):
@@ -253,7 +324,7 @@ def _rule_question_ids(node: Any, out: set[str] | None = None) -> set[str]:
                     _rule_question_ids(c, out)
             else:
                 out.add(k)
-    return out
+    return out - {"continuation"}
 
 
 def _eval_rule(node: Any, values: dict[str, float]) -> tuple[bool, str]:
@@ -284,6 +355,10 @@ def _eval_rule(node: Any, values: dict[str, float]) -> tuple[bool, str]:
 
 
 class JevGatePlugin(Star):
+    # 触发前防抖的合并重评轮数上限: 防止发送者持续连发导致无限"等→重评"循环。
+    # 3 轮 × debounce_max_wait_seconds 即单次提名的最大额外延迟。
+    _DEBOUNCE_MAX_ROUNDS = 3
+
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
         super().__init__(context)
         self.config = config
@@ -415,15 +490,20 @@ class JevGatePlugin(Star):
         """内置规则硬依赖这几个问题 ID, 缺了就会永远不提名——提前喊一声。
 
         自定义 nomination_rule 时这些 ID 不再必需(规则引用什么就要求什么),
-        所以只在用内置规则时检查。
+        所以只在用内置规则时检查。防抖开启时额外要求 is_unfinished:
+        缺了它防抖拿不到"话没说完"的概率, 会静默退化为无防抖。
         """
-        if self._nomination_rule() is not None:
-            return
-        missing = [q for q in ("is_mentioned", "is_good_moment") if q not in self._questions_for("0")]
-        if missing:
+        if self._nomination_rule() is None:
+            missing = [q for q in ("is_mentioned", "is_good_moment") if q not in self._questions_for("0")]
+            if missing:
+                logger.warning(
+                    f"[JevGate] 配置的 questions 里缺少 {missing}，"
+                    "提名条件依赖它们，插件将不会触发（见 README「自定义问题」）"
+                )
+        if self._cfg("debounce_enabled", False) and "is_unfinished" not in self._questions_for("0"):
             logger.warning(
-                f"[JevGate] 配置的 questions 里缺少 {missing}，"
-                "提名条件依赖它们，插件将不会触发（见 README「自定义问题」）"
+                "[JevGate] 开启了触发前防抖但 questions 里没有 is_unfinished，"
+                "防抖将不生效（每条提名立即触发）；把 questions 恢复默认或加回该问题"
             )
 
     def _session_enabled(self, umo: str) -> bool:
@@ -465,7 +545,15 @@ class JevGatePlugin(Star):
     # ─── 消息处理 ──────────────────────────────────────────────────────────
 
     def _flatten(self, event: AstrMessageEvent) -> str:
-        """把消息组件拉平成文本, 与 collector 导出的格式保持一致。"""
+        """把消息组件拉平成文本, 与 collector 导出的格式保持一致。
+
+        长度护栏(v0.3.6): max_message_chars 截断后再返回。截断发生在唯一
+        入口, 评估上下文/触发提示/账本看到的都是同一份; 完整原文不受影响
+        ——群历史由内置 star 独立落库, LLM 回复时照样能看到全文。
+        背景: state 超过 ~32k token 会被 Jev 400 拒绝(max_tokens_exceeded),
+        且超长条目留在缓冲里会连带同窗口后续评估一起失败; Jev 还有
+        context rot, 无关长材料稀释判定精度。
+        """
         parts: list[str] = []
         for comp in event.get_messages():
             if isinstance(comp, Plain):
@@ -477,7 +565,76 @@ class JevGatePlugin(Star):
         text = "".join(parts).strip()
         if not text:
             text = (event.get_message_str() or "").strip()
+        cap = int(self._cfg("max_message_chars", 500))
+        if cap > 0 and len(text) > cap:
+            text = f"{text[:cap]}…[截断,原{len(text)}字]"
         return text
+
+    async def _expand_forwards(self, event: AstrMessageEvent, text: str) -> str:
+        """把 _flatten 留下的 [Forward] 占位换成转发里的聊天记录。
+
+        只有占位时 Jev 看不到内容, 转发几乎拿不到提名(实测 reply_value 0.31)。
+        走主线引用解析同款 get_forward_msg 取一层(OneBotClient 内部已做各实现
+        的参数名兼容); 字数上限挂 max_message_chars×4(关闭时 2000), 不旁路长度
+        护栏口径, 行数上限 _FORWARD_MAX_LINES。取/解析整体兜错——解析器是给
+        引用解析写的, 意外 payload 形状不能炸掉整条 handler; 非 OneBot 平台、
+        调用失败或解析为空时保留占位, 行为与旧版一致。
+        """
+        if OneBotClient is None or "[Forward]" not in text:
+            return text
+        forwards = [c for c in event.get_messages() if isinstance(c, Forward)]
+        if not forwards:
+            return text
+        cap = int(self._cfg("max_message_chars", 500))
+        char_cap = cap * 4 if cap > 0 else 2000
+        client = OneBotClient(event)
+        parser = OneBotPayloadParser()
+        for comp in forwards:
+            if "[Forward]" not in text:  # 截断可能吃掉尾部占位符, 到头就停
+                break
+            try:
+                payload = await asyncio.wait_for(
+                    client.get_forward_msg(comp.id), _FORWARD_FETCH_TIMEOUT
+                )
+                content = (
+                    parser.parse_get_forward_payload(payload)["text"]
+                    if payload
+                    else None
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.debug(
+                    f"[JevGate] 获取/解析合并转发失败, 保留占位: id={comp.id} {e!r}"
+                )
+                continue
+            if not content:
+                continue
+            clipped = "\n".join(content.splitlines()[:_FORWARD_MAX_LINES])[:char_cap]
+            if len(clipped) < len(content):
+                clipped += "\n……(转发内容过长, 已截断)"
+            # 占位符彼此相同, 按组件顺序 replace(…,1) 逐个命中
+            text = text.replace("[Forward]", f"[合并转发]\n{clipped}", 1)
+        return text
+
+    @staticmethod
+    def _render_poke(event: AstrMessageEvent) -> str:
+        """把「bot 被戳」渲染成语义文本, 供 Jev 评估与触发 prompt。
+
+        OneBot poke notice 自带 action/suffix 动作描述(如「戳了戳」+
+        「的尾巴，并被反过来哈气」), 比裸 "[Poke]" 信息量大——Jev 判断
+        "这条值不值得回应"、LLM 决定怎么接, 都靠这点语义。取不到字段
+        (适配器差异/字段缺失)时退回 "[Poke]", 绝不让渲染抛错毁掉评估。
+        """
+        action = suffix = ""
+        raw = getattr(event.message_obj, "raw_message", None)
+        try:
+            if raw is not None:
+                action = str(raw.get("action") or "").strip()
+                suffix = str(raw.get("suffix") or "").strip()
+        except Exception:  # raw_message 形态因适配器而异
+            pass
+        if action or suffix:
+            return f"[戳一戳] {action}{suffix}".strip()
+        return "[Poke]"
 
     def _is_at_bot(self, event: AstrMessageEvent, self_id: str) -> bool:
         for comp in event.get_messages():
@@ -557,12 +714,149 @@ class JevGatePlugin(Star):
                 "trigger_sender": "",
                 # 日评估上限命中告警只喊一次(按会话+日期去重)
                 "eval_cap_logged": "",
+                # 触发前防抖(v0.3.6): 该发送者的提名正在等"话没说完"的后续,
+                # 期间他的新消息被吸收进缓冲, 不再单独评估
+                "debounce_sender": "",
+                "debounce_active_until": 0.0,
             }
             self._sessions[umo] = st
         return st
 
     def _today(self) -> str:
         return datetime.date.today().isoformat()
+
+    def _in_active_dialogue(self, umo: str, sender_id: str) -> bool:
+        """bot 刚回复过该发送者且在 followup 窗口内 = 接续对话。
+
+        last_dispatch_* 是乐观标记(触发即记, 拒答回滚), 所以"回复还在生成
+        中"的间隙同样算对话中——接续提名正是要覆盖这个间隙。窗口语义与冷却
+        的 followup 一致: followup_window_minutes<=0 = 不限窗口。
+        """
+        st = self._sessions.get(umo)
+        if st is None or not sender_id or sender_id != st.get("last_dispatch_sender"):
+            return False
+        window_min = int(self._cfg("followup_window_minutes", 10))
+        if window_min <= 0:
+            return True
+        return time.time() - st.get("last_dispatch_ts", 0.0) < window_min * 60
+
+    async def _debounce_wait(
+        self,
+        umo: str,
+        st: dict[str, Any],
+        sender_id: str,
+        sender_name: str,
+        self_id: str,
+        text: str,
+        reason: str,
+        nominated: bool,
+        nouls: dict[str, Any],
+        value: float | None,
+        rule: dict | None,
+        target_entry: dict[str, Any],
+        record: dict[str, Any],
+    ) -> tuple[str, bool, str]:
+        """触发前防抖: is_unfinished 概率映射延迟, 等待期吸收同发送者的后续消息。
+
+        流程(每轮):
+        1. p = nouls["is_unfinished"], p < debounce_confidence_floor → 不等,
+           立即触发(概率低=话说完了);
+        2. 否则 delay = min + (max-min) × (p-floor)/(1-floor) —— 越像"没说完"
+           等越久; 分片小睡盯缓冲, 不持锁;
+        3. 安静期满没有新消息 → 按现文触发;
+        4. 有新消息 → 与目标合并(仅同发送者, 他人插话留在上下文)重评一遍完整
+           提名: 否决 → 整个退出(调用方退款); 仍提名 → 带新 p 进下一轮。
+        最多 _DEBOUNCE_MAX_ROUNDS 轮, 防止持续连发导致无限循环。
+
+        返回 (最终文本, 是否仍提名, 最终原因)。期间 st["debounce_sender"]
+        置位, 同发送者的新消息在 on_group_message 入口被吸收(不再单独评估);
+        finally 里清除, active_until 是生成器异常退出时的自愈上限。
+        """
+        floor = float(self._cfg("debounce_confidence_floor", 0.5))
+        min_w = max(0, int(self._cfg("debounce_min_wait_seconds", 5)))
+        max_w = int(self._cfg("debounce_max_wait_seconds", 20))
+        if max_w < min_w:
+            max_w = min_w
+        merge_win = int(self._cfg("merge_window_seconds", 20))
+        merge_max = int(self._cfg("merge_max_count", 10))
+        questions = self._questions_for(self_id)
+        thresholds = self._thresholds()
+        window = int(self._cfg("context_window", 15))
+        trail: dict[str, Any] = {"rounds": 0, "absorbed": 0, "delays_s": []}
+        st["debounce_sender"] = sender_id
+        st["debounce_active_until"] = time.time() + self._DEBOUNCE_MAX_ROUNDS * max_w + 10
+        last_seg_len = 1  # 缓冲里目前只有目标消息本身
+        try:
+            for _ in range(self._DEBOUNCE_MAX_ROUNDS):
+                p = nouls.get("is_unfinished")
+                if p is None or float(p) < floor:
+                    return text, nominated, reason
+                frac = (float(p) - floor) / max(1e-9, 1.0 - floor)
+                delay = max(min_w, min(max_w, min_w + (max_w - min_w) * frac))
+                trail["rounds"] += 1
+                trail["delays_s"].append(round(delay, 1))
+                deadline = time.time() + delay
+                while time.time() < deadline:
+                    await asyncio.sleep(min(0.5, max(0.05, deadline - time.time())))
+
+                buf = list(st["buffer"])
+                try:
+                    seg_start = next(i for i, e in enumerate(buf) if e is target_entry)
+                except StopIteration:
+                    break  # 目标条目已被挤出 deque 窗口, 放弃等待直接触发
+                seg = [e["content"] for e in buf[seg_start:] if e.get("sender_id") == sender_id]
+                if len(seg) <= last_seg_len:
+                    return text, nominated, reason  # 本轮等待无新消息 → 按现文触发
+                text = " / ".join(seg)
+                trail["absorbed"] = len(seg) - 1
+                last_seg_len = len(seg)
+
+                # 合并重评: 上下文取目标之前的条目(目标段整体移出上下文)
+                seg_start_idx = next(i for i, e in enumerate(buf) if e is target_entry)
+                context = buf[:seg_start_idx][-window:]
+                state = self._build_state(
+                    self._persona_for(self_id), context, sender_name, text,
+                    merge_window_s=merge_win, merge_max=merge_max,
+                )
+                try:
+                    t0 = time.monotonic()
+                    resp = await self._call_jev(state, questions)
+                    record["latency_s"] = round(time.monotonic() - t0, 2)
+                except Exception as e:  # noqa: BLE001
+                    # 重评失败不推翻已通过的初评, 保守按原样触发
+                    logger.warning(f"[JevGate] 防抖重评失败, 按初评结果触发: {e}")
+                    return text, nominated, reason
+                answers = resp.get("answers", {})
+                nouls = {k: v.get("noul") for k, v in answers.items() if v.get("type") == "noul"}
+                rv = answers.get("reply_value", {})
+                value = rv.get("score")
+                nominated, reason = self._nominate(
+                    nouls, value, thresholds, rule, self._in_active_dialogue(umo, sender_id)
+                )
+                record["nouls"] = nouls
+                record["reply_value"] = {
+                    "score": value,
+                    "probabilities": rv.get("probabilities"),
+                    "confidence": rv.get("confidence"),
+                }
+                record["reason"] = reason
+                record["nominated"] = nominated
+                if not nominated:
+                    record["trigger"] = {
+                        "choice": "skip", "detail": "debounce_rejected",
+                        "absorbed": trail["absorbed"],
+                    }
+                    logger.info(
+                        f"[JevGate] 防抖重评否决提名({sender_name}): "
+                        f"合并 {trail['absorbed']} 条后续后不再值得接话, 放弃触发"
+                    )
+                    return text, False, reason
+            return text, nominated, reason  # 轮数用尽仍提名 → 触发
+        finally:
+            if trail["rounds"]:
+                record["debounce"] = trail
+            st["debounce_sender"] = ""
+            st["debounce_active_until"] = 0.0
 
     # ─── Jev API ───────────────────────────────────────────────────────────
 
@@ -590,6 +884,9 @@ class JevGatePlugin(Star):
                 headers={
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
+                    # 网关侧 Cloudflare(如 commandcode)按浏览器签名封 Python-urllib
+                    # 默认 UA(error 1010 → HTTP 403), 自定义 UA 是过边缘的硬性要求
+                    "User-Agent": "astrbot-plugin-jev_gate/0.3.8",
                 },
                 method="POST",
             )
@@ -625,16 +922,21 @@ class JevGatePlugin(Star):
         value: float | None,
         th: dict[str, float],
         rule: dict | None = None,
+        in_dialogue: bool = False,
     ) -> tuple[bool, str]:
         """返回 (是否提名, 原因)。
 
-        `rule` 为 None 时走内置两条路径(阈值取自 th); 给了 rule 就按自定义
-        布尔表达式求值, 原因串由实际命中的子句生成(便于回账本追溯)。
+        `rule` 为 None 时走内置路径(阈值取自 th); 给了 rule 就按自定义
+        布尔表达式求值(求值 values 注入伪值 continuation), 原因串由实际
+        命中的子句生成(便于回账本追溯)。
+        `in_dialogue` = bot 刚回复过该发送者且在 followup 窗口内:
+        规则路径注入 continuation 伪值; 内置路径追加放宽的接续提名线。
         """
         if rule is not None:
             values: dict[str, float] = dict(nouls)
             if value is not None:
                 values["reply_value"] = float(value)
+            values["continuation"] = 1.0 if in_dialogue else 0.0
             return _eval_rule(rule, values)
         m = float(nouls.get("is_mentioned") or 0.0)
         g = float(nouls.get("is_good_moment") or 0.0)
@@ -642,6 +944,10 @@ class JevGatePlugin(Star):
             return True, f"possible_mention({m:.2f})"
         if (value or 0.0) >= th["reply_value"] and g > th["is_good_moment"]:
             return True, f"value({value:.2f})+moment({g:.2f})"
+        if in_dialogue:
+            bar = float(th.get("continuation_reply_value", 1.2))
+            if (value or 0.0) >= bar:
+                return True, f"continuation:reply_value({value:.2f}>={bar:.2f})"
         return False, ""
 
     # ─── 入站: 判断; 提名时 yield 触发 ─────────────────────────────────────
@@ -690,6 +996,7 @@ class JevGatePlugin(Star):
             st = self._session(umo)
             st["buffer"].append({
                 "ts": time.time(), "time": _now_str(), "name": sender_name,
+                "sender_id": sender_id,
                 "content": text or "[非文本]",
                 "is_self": False, "is_bot": True,
             })
@@ -708,6 +1015,7 @@ class JevGatePlugin(Star):
             st = self._session(umo)
             st["buffer"].append({
                 "ts": time.time(), "time": _now_str(), "name": sender_name,
+                "sender_id": sender_id,
                 "content": text or "[非文本]",
                 "is_self": False, "is_bot": sender_id in other_bots,
             })
@@ -721,17 +1029,69 @@ class JevGatePlugin(Star):
                 f"skip_directed_messages=True"
             )
             return
+        # 合并转发展开(v0.3.8): 放在 @bot/指向别处的早退之后, 只有真正要进
+        # 缓冲和评估的消息才多调一次 OneBot; 戳一戳等事件不含 Forward, 无感
+        text = await self._expand_forwards(event, text)
         if _SKIP_TEXT_RE.match(text):
             return
 
+        # ── 戳一戳(notice 事件): 缓冲照进, 评估默认不进(v0.3.7) ──
+        # 2026-09-27 生产实锤: 适配器把 poke notice 转成普通群消息事件
+        # (message=[Poke], message_str="", 不区分 target 是谁), "[Poke]"
+        # 被送进 Jev 评估, 活跃对话中打分过线(value 1.54 + moment 0.56)
+        # 造成误提名——bot 对"戳别人"的行为回话。戳别人(target≠bot)一律
+        # 不评估(行为修复, 无开关); 戳 bot 自身默认同样只进缓冲, 需显式
+        # 开启 poke_self_evaluation 才送 Jev 评估。
+        poke_comp = next(
+            (c for c in event.get_messages() if isinstance(c, Poke)), None
+        )
+        if poke_comp is not None:
+            poke_target = str(poke_comp.target_id() or "")
+            self_poke = poke_target == self_id
+            if not self_poke or not self._cfg("poke_self_evaluation", False):
+                st = self._session(umo)
+                st["buffer"].append({
+                    "ts": time.time(), "time": _now_str(), "name": sender_name,
+                    "sender_id": sender_id,
+                    "content": text or "[非文本]",
+                    "is_self": False, "is_bot": sender_id in other_bots,
+                })
+                self._append_ledger({
+                    "ts": time.time(), "kind": "notice_skip", "session": umo,
+                    "sender": sender_name, "content": text,
+                    "detail": "poke_self" if self_poke else "poke_other",
+                })
+                return
+            # bot 被戳且自戳评估已开启: 语义化渲染后走完整评估/提名链,
+            # 冷却/日限/防抖/[PASS] 终审与普通消息同权
+            text = self._render_poke(event)
+
         st = self._session(umo)
 
-        # 上下文缓冲: 进评估的消息都进 (含其他 bot, 供 Jev 看全场)
-        st["buffer"].append({
+        # 上下文缓冲: 进评估的消息都进 (含其他 bot, 供 Jev 看全场)。
+        # sender_id 供防抖吸收判定与视图级合并用
+        target_entry = {
             "ts": time.time(), "time": _now_str(), "name": sender_name,
+            "sender_id": sender_id,
             "content": text or "[非文本]",
             "is_self": False, "is_bot": sender_id in other_bots,
-        })
+        }
+        st["buffer"].append(target_entry)
+
+        # 防抖吸收(v0.3.6): 该发送者的提名正在等"话没说完"的后续, 他的新
+        # 消息不单独评估, 由进行中的防抖合并重评兜底。放行条件里的
+        # active_until 是自愈上限——防抖生成器若异常退出, 标记最多存活到
+        # 该时刻, 不会把人永久静音。
+        if (
+            self._cfg("debounce_enabled", False)
+            and sender_id == st.get("debounce_sender")
+            and time.time() < st.get("debounce_active_until", 0.0)
+        ):
+            self._append_ledger({
+                "ts": time.time(), "kind": "debounce_absorbed", "session": umo,
+                "sender": sender_name, "content": text,
+            })
+            return
 
         # ── Layer 0: 日评估上限(计数器只加锁操作, Jev 调用本身不持锁) ──
         today = self._today()
@@ -754,7 +1114,11 @@ class JevGatePlugin(Star):
         ts = time.time()
         msg_id = str(event.message_obj.message_id) if event.message_obj else ""
         context = list(st["buffer"])[:-1][-int(self._cfg("context_window", 15)):]
-        state = self._build_state(self._persona_for(self_id), context, sender_name, text)
+        state = self._build_state(
+            self._persona_for(self_id), context, sender_name, text,
+            merge_window_s=int(self._cfg("merge_window_seconds", 20)),
+            merge_max=int(self._cfg("merge_max_count", 10)),
+        )
         try:
             t0 = time.monotonic()
             resp = await self._call_jev(state, self._questions_for(self_id))
@@ -779,7 +1143,8 @@ class JevGatePlugin(Star):
         rv = answers.get("reply_value", {})
         value = rv.get("score")
         rule = self._nomination_rule()
-        nominated, reason = self._nominate(nouls, value, self._thresholds(), rule)
+        in_dialogue = self._in_active_dialogue(umo, sender_id)
+        nominated, reason = self._nominate(nouls, value, self._thresholds(), rule, in_dialogue)
 
         record: dict[str, Any] = {
             "ts": ts, "kind": "evaluated", "session": umo,
@@ -796,6 +1161,7 @@ class JevGatePlugin(Star):
             "latency_s": round(latency, 2),
             "nominated": nominated,
             "reason": reason,
+            "in_dialogue": in_dialogue,
         }
 
         if not nominated:
@@ -867,6 +1233,22 @@ class JevGatePlugin(Star):
             st["last_dispatch_sender"] = sender_id
             st["trigger_sender"] = sender_id
 
+        # ── 触发前防抖(v0.3.6): is_unfinished 概率映射延迟, 等待期吸收同
+        # 发送者的后续消息, 安静期一到合并重评。重评否决 → 退款退出。
+        # 放在乐观标记之后: 等待期间该发送者已被视为"对话中", 重评的接续
+        # 路径可用。不持 st["lock"], 其他消息的处理不受等待影响。
+        if self._cfg("debounce_enabled", False):
+            text, nominated, reason = await self._debounce_wait(
+                umo, st, sender_id, sender_name, self_id,
+                text, reason, nominated, nouls, value, rule, target_entry, record,
+            )
+            record["content"] = text
+            if not nominated:
+                # 重评后不再值得接话: 退还日限与连续性标记(同拒答语义)
+                self._refund_trigger(umo)
+                self._append_ledger(record)
+                return
+
         if self._cfg("dry_run", True):
             record["trigger"] = {"choice": "dry_run", "detail": "logged_only"}
             self._append_ledger(record)
@@ -916,6 +1298,15 @@ class JevGatePlugin(Star):
             "conversation": cid[:8],
         }
         self._append_ledger(record)
+        # 与跳过/dry-run/防抖否决对齐: 真实触发也是唯一在控制台可见的路径,
+        # 字段与账本 dispatch 行一一对应, 便于和主线日志对时间轴
+        logger.info(
+            f"[JevGate] 触发主动回复: {sender_name}: {text[:40]} | "
+            f"reason={reason} in_dialogue={in_dialogue} "
+            f"debounce={record.get('debounce')} "
+            f"model={record.get('model')} latency_s={record.get('latency_s')} "
+            f"conversation={cid[:8]}"
+        )
         yield req
 
     async def _current_conversation(self, umo: str, event: AstrMessageEvent):
@@ -939,6 +1330,61 @@ class JevGatePlugin(Star):
             logger.warning(f"[JevGate] 对话读取/新建失败: {e}")
             return None, ""
 
+    # ─── LLM 回复标记 + bot 侧上下文回写 ──────────────────────────────────
+
+    @filter.on_llm_response()
+    async def on_llm_mark_reply(self, event: AstrMessageEvent, resp) -> None:
+        """给所有 LLM 回复打标记(双钩子模式的自持版)。
+
+        出站守卫的"覆盖所有 LLM 回复"和 after_message_sent 的缓冲回写都
+        需要知道"这是 LLM 回复"。此前依赖 fold_fan_formatter/splitter 等
+        环境插件代打 __is_llm_reply, 裸装市场用户没有它们 → 守卫静默失效。
+        本插件自打标记后不再有这个依赖(环境插件打的 __is_llm_reply 仍然
+        认, 两套标记并存)。
+        """
+        try:
+            setattr(event, _JEVGATE_LLM_MARK, True)
+        except Exception:  # noqa: BLE001
+            pass
+
+    @filter.after_message_sent()
+    async def on_after_message_sent(self, event: AstrMessageEvent) -> None:
+        """bot 真实发出的 LLM 回复写进会话缓冲(is_self), 让 Jev 看见对话的 bot 侧。
+
+        此前缓冲只有群友消息: bot 自己的入站消息在 handler 开头就 return,
+        主动回复也不经过 event_message_type——_build_state 的 is_self→"(我)"
+        渲染是死代码, Jev 评"那拔网线"这类省略式接续时看不见 bot 刚说过
+        什么(2026-09-25 实锤: is_mentioned 0.40 落选, 而 18 秒前 bot 刚回复
+        过同一人)。RespondStage 对空链直接返回不触发本钩子, 所以被守卫
+        清空的拒答轮天然不会进来。
+        """
+        try:
+            triggered = bool(event.get_extra(_JEVGATE_TRIGGER_MARK))
+            if (
+                not triggered
+                and not getattr(event, "__is_llm_reply", False)
+                and not getattr(event, _JEVGATE_LLM_MARK, False)
+            ):
+                return
+            umo = event.unified_msg_origin
+            if not self._session_enabled(umo):
+                return
+            result = event.get_result()
+            chain = getattr(result, "chain", None) if result is not None else None
+            if not chain:
+                return
+            text = "".join(getattr(c, "text", "") or "" for c in chain).strip()
+            if not text:
+                return  # 纯图片/表情等非文本回复, 无对话价值
+            st = self._session(umo)
+            st["buffer"].append({
+                "ts": time.time(), "time": _now_str(), "name": "bot",
+                "sender_id": "",
+                "content": text, "is_self": True, "is_bot": False,
+            })
+        except Exception:  # noqa: BLE001
+            pass  # 旁路钩子, 绝不影响发送链路
+
     # ─── 拒答守卫: 管线原生匹配, 精确白名单 ────────────────────────────────
 
     @filter.on_decorating_result(priority=99990)
@@ -958,7 +1404,11 @@ class JevGatePlugin(Star):
         本插件触发轮改为包含匹配——整条里出现 token 就算拒答。
         """
         triggered = bool(event.get_extra(_JEVGATE_TRIGGER_MARK))
-        if not triggered and not getattr(event, "__is_llm_reply", False):
+        if (
+            not triggered
+            and not getattr(event, "__is_llm_reply", False)
+            and not getattr(event, _JEVGATE_LLM_MARK, False)
+        ):
             return
         result = event.get_result()
         chain = getattr(result, "chain", None) if result is not None else None
@@ -1080,11 +1530,49 @@ class JevGatePlugin(Star):
                 logger.warning(f"[JevGate] 清理会话历史失败: {e}")
 
     @staticmethod
+    def _coalesce_context(
+        entries: list[dict[str, Any]], window_s: int, max_count: int
+    ) -> list[dict[str, Any]]:
+        """相邻同发送者条目合并成一条(视图级, 不动缓冲本体)。
+
+        只影响发给 Jev 的渲染: 碎片化打字在 state 里连成整段话, 更接近人类
+        阅读方式, 也让有限的 context_window 装下更多有效内容。窗口从上一片
+        的时间滑到下一片(碎片间隔短就继续并), 合并满 max_count 条为止。
+        sender_id 为 None 的条目(旧数据/无主)不参与合并。合并时浅拷贝,
+        绝不改缓冲里的原始 dict——防抖按对象身份定位目标条目。
+        """
+        if window_s <= 0 or max_count <= 1 or not entries:
+            return [dict(e) for e in entries]
+        out: list[dict[str, Any]] = []
+        for e in entries:
+            prev = out[-1] if out else None
+            if (
+                prev is not None
+                and e.get("sender_id") is not None
+                and e.get("sender_id") == prev.get("sender_id")
+                and e["ts"] - prev["ts"] <= window_s
+                and prev["_n"] < max_count
+            ):
+                prev["content"] += " / " + e["content"]
+                prev["ts"] = e["ts"]
+                prev["_n"] += 1
+            else:
+                d = dict(e)
+                d["_n"] = 1
+                out.append(d)
+        return out
+
+    @staticmethod
     def _build_state(
-        persona: str, context: list[dict[str, Any]], sender: str, content: str
+        persona: str,
+        context: list[dict[str, Any]],
+        sender: str,
+        content: str,
+        merge_window_s: int = 0,
+        merge_max: int = 1,
     ) -> dict[str, Any]:
         lines = []
-        for entry in context:
+        for entry in JevGatePlugin._coalesce_context(context, merge_window_s, merge_max):
             name = entry["name"]
             if entry.get("is_self"):
                 name += "(我)"

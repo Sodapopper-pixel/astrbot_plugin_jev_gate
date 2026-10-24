@@ -7,6 +7,8 @@
 - **不越权**：只做"判断 + 触发"，人格/对话历史/分段/落库全部交给 AstrBot 主线，主动回复和普通回复走同一条管线
 - 内置 dry-run 只审计模式：只打分写账本，确认提名质量后再开启实发
 - 冷却时间（默认关，可开）、每日触发上限、每日评估上限三重护栏
+- 接续对话识别：bot 回复写入评估上下文，省略主语的接话走放宽提名线，不再被字面无指向卡住
+- 长消息截断 + 碎片消息合并 + 可选的触发前防抖（Jev 判断"话没说完"才等，概率越高等越久）
 - 每次被门控拦下都打 info 日志，带上配置字段与实测值，不用翻账本
 - 触发时会把提名原因告知 bot，可自行拒绝（输出 [PASS]，拒答不消耗冷却和日限）
 - 使用需要自备 TypeSafe API Key（https://console.typesafe.ai/keys）。
@@ -35,12 +37,13 @@ Jev 是 System One 模型：不生成文字，只回答你定义好的结构化�
   │    每日评估上限
   │
   └─ Layer 1 Jev 提名（约 $0.0001/条）
-       输入：人设 + 最近 N 条群聊 + 这条消息
+       输入：人设 + 最近 N 条群聊（含 bot 自己的回复）+ 这条消息
        6 个问题：5 个 noul（0-1 概率）+ 1 个 reply_value（0-3 分级）
        内置提名条件（nomination_rule 留空时，阈值取 thresholds）：
          is_mentioned ≥ 0.6
          或 reply_value ≥ 1.5 且 is_good_moment > 0.45
-       填了 nomination_rule 就按自定义布尔表达式求值
+         或 接续对话中（bot 刚回复过的发送者在窗口内接着说）reply_value ≥ 1.2
+       填了 nomination_rule 就按自定义布尔表达式求值（可用伪值 continuation）
          │
          ▼
   Layer 2 触发（通过每日上限，和可选的冷却之后）
@@ -96,9 +99,17 @@ Jev 是 System One 模型：不生成文字，只回答你定义好的结构化�
 | `nomination_rule` | 空（内置规则） | 提名规则（JSON 布尔表达式）。**questions 里加的新问题要靠它才能参与提名**，详见下面「自定义提名规则」 |
 | `thresholds` | 见下 | 提名阈值（键=问题 ID）。只驱动内置提名规则；填了 `nomination_rule` 后数字写在规则里 |
 | `context_window` | `15` | 评估时附带的历史消息条数，越大越准也越贵 |
+| `max_message_chars` | `500` | 单条消息截断长度（字符，0 = 不截断）。超长粘贴会稀释 Jev 判定（context rot），state 超约 32k token 还会被 API 400 拒绝并连带同窗口后续评估失败。完整原文不受影响——群历史由主线独立落库，bot 回复照样看得到全文 |
+| `merge_window_seconds` | `20` | 缓冲合并窗口（秒，0 = 关）：同一发送者窗口内的连续消息在发给 Jev 的上下文里合并成一条，碎片化打字连成整段话。只影响评估视图，账本仍按单条记 |
+| `merge_max_count` | `10` | 一条合并消息最多包含的原始消息数 |
+| `debounce_enabled` | `false` | 触发前防抖。提名后用新问题 `is_unfinished`（搭并行提问便车，零额外成本）判断「话是不是没说完」：概率低于下限立即触发；越像没说完等越久（线性映射到延迟区间）；等待期同一发送者的新消息被吸收，安静期满合并重评一次再决定，重评否决则放弃并退还额度。最多连续 3 轮 |
+| `debounce_confidence_floor` | `0.5` | 防抖概率下限：`is_unfinished` 低于此值 = 话说完了，不等待 |
+| `debounce_min_wait_seconds` | `5` | 概率正好等于下限时的等待时长 |
+| `debounce_max_wait_seconds` | `20` | 概率 1.0 时的等待时长（单次提名最大额外延迟约 3×此值） |
 | `other_bot_ids` | `[]` | **防止 bot 之间刷屏**：群里其他机器人的账号。作用是提醒 Jev 注意这些账号是机器人——上下文里它们的发言标注为「机器人」，引用它们的消息也不会抢答 |
 | `evaluate_other_bots` | `false` | **直接无视**其他 bot 的发言：不评估、不触发，但上下文里仍标注为机器人供 Jev 看全场。`true` = 照常评估（可能接 bot 的话，慎用） |
 | `skip_directed_messages` | `true` | @ 指向别人的消息不接话：消息 @ 了任何其他账号（含 @全体）、或引用了其他 bot 的消息时跳过。关掉则交还 Jev 评估（可能抢答） |
+| `poke_self_evaluation` | `false` | 识别 bot 自身被戳一戳（v0.3.7 新增）：开启后，群友戳 bot 自己的事件渲染成「[戳一戳] 戳了戳的尾巴…」送 Jev 评估，过提名阈值才触发回复；关闭时所有戳一戳只进评估上下文缓冲，不评估不回复。**戳别人的事件任何时候都不评估**（v0.3.7 修复的误触发） |
 | `cooldown_minutes` | `30` | 两次主动触发的最小间隔（对"接着聊"无效，见下一行）。仅在 `cooldown_enabled=true` 时生效 |
 | `cooldown_enabled` | `false` | 冷却总开关。**默认关**：提名通过日限就直接触发，连续对话不会再被冷却墙拦。开启后仅约束主动触发频率，@点名回复不受影响；真正的上限是 `daily_limit`（默认 5 次/会话/天）。`cooldown_minutes=0` 等效关闭 |
 | `followup_window_minutes` | `10` | 连续对话判定窗口：bot 刚回复过的发送者，在此窗口内继续说话算"接着聊"，走 `followup_cooldown_seconds` 短冷却。**`0` = 不限窗口**（同一发送者永远算接着聊，不是"窗口 0 秒"——后者会反被长冷却拦死） |
@@ -189,10 +200,38 @@ Jev 是 System One 模型：不生成文字，只回答你定义好的结构化�
 ```
 
 - 问题 ID 可以是 `questions` 里任意 `noul` 问题或 `reply_value`
+- 伪值 `continuation`：bot 刚回复过的发送者在连续对话窗口内 = 1.0，否则 0.0。接续对话场景可写 `{"all": [{"continuation": {">=": 0.5}}, {"reply_value": {">=": 1.2}}]}`
 - 留空 = 用内置规则（阈值读 `thresholds`）；填了规则后数字写在规则里，`thresholds` 不再参与
 - 规则引用了一个 `questions` 里不存在的问题 ID：该条件永远不成立，启动时会告警
 - **写错不会静默失效**：坏 JSON 或结构不合法会自动回退内置规则并在日志告警；回退后行为和你没填规则时完全一致
 - 命中的原因会写进账本 `reason` 字段（如 `is_ask_for_help(0.82>=0.7)`），方便回查是哪条子句放行的
+
+### 接续对话提名
+
+省略主语/称呼的接话（"那拔网线""那你倒是说啊"）字面上没有任何指向，正常打分够不着 `is_mentioned` 0.6 和 `reply_value` 1.5 两条线——实测一条 18 秒前 bot 刚回复过同一发送者的"那拔网线"只拿了 mention 0.40 / value 1.40。为此内置第三条提名路径：
+
+- **条件**：bot 刚回复过的**同一发送者**（触发即乐观记录，拒答会回滚）在 `followup_window_minutes` 窗口内接着说话
+- **提名线**：`reply_value >= continuation_reply_value`（thresholds 新键，默认 **1.2**；设 3.1 以上等效关闭）
+- 兜底链不变：`daily_limit` 照计数、LLM 终审可 `[PASS]`、拒答退还额度。窗口内这人转头跟别人聊导致误提名的代价就是一次终审 [PASS]
+- 账本 `reason` 会标记为 `continuation:reply_value(1.40>=1.20)`，`in_dialogue: true/false` 记录当时是否在对话中，方便统计这条路径的实际效果
+
+配套地，bot 自己发出的回复现在也会进入评估上下文（渲染为 `bot(我): …`）——此前 Jev 只看得见群友的消息，判断"这是不是接续对话"时根本不知道 bot 刚说过什么。
+
+### 长消息、碎片消息与防抖
+
+**超长消息**：`max_message_chars`（默认 500）截断后进评估。截断发生在唯一入口，评估上下文/触发提示/账本看到同一份；bot 回复时不受影响——完整原文由主线写进群历史，LLM 从群历史里看得到。背景：state 超约 32k token 会被 Jev 400 拒绝，而且超长条目留在上下文缓冲里会**连带同窗口后续所有评估一起失败**；官方文档还明确 Jev 有 context rot，无关长材料稀释精度。
+
+**碎片消息**：`merge_window_seconds`（默认 20 秒）+ `merge_max_count`（默认 10 条）。同一发送者窗口内的连续消息在发给 Jev 的上下文里合并成一条（`msg1 / msg2 / msg3`），QQ 碎片化打字的常态不再被切成零散小句。纯视图变换：缓冲本体保持单条，账本按单条记。
+
+**触发前防抖**（`debounce_enabled`，默认关）：解决"burst 第一句就抢答"的问题。流程：
+
+1. 消息照常即时评估记账（`is_unfinished` 是并行问题之一，零额外成本）
+2. 提名后看 `is_unfinished` 概率 p：低于 `debounce_confidence_floor`（默认 0.5）→ 话说完了，立即触发
+3. 否则等待 `min + (max-min) × (p-下限)/(1-下限)` 秒——**越像没说完等越久**
+4. 等待期该发送者的新消息被吸收（记 `debounce_absorbed`，不再单独评估，不占日评估额度）
+5. 安静期满有被吸收的消息 → 合并重评一遍完整提名：仍提名 → 回到第 3 步（最多 3 轮）；否决 → 放弃触发并退还日限额度（记 `debounce_rejected`）
+
+延迟只落在少数被提名的消息上，普通消息零影响；@bot 点名路径完全绕开。实现是在生成器内分片等待，不起后台任务，热重载安全。账本 `debounce` 字段记录轮数/吸收条数/每轮延迟，方便观察实际效果后再调参。
 
 ## 账本与调优
 
@@ -200,11 +239,11 @@ Jev 是 System One 模型：不生成文字，只回答你定义好的结构化�
 
 | 字段 | 含义 |
 |---|---|
-| `kind` | `evaluated`（评估过）/ `mention_code_skip`（@bot，代码层跳过）/ `directed_skip`（@指向别处，跳过）/ `error` |
-| `nouls` | 各 noul 问题的原始概率 |
+| `kind` | `evaluated`（评估过）/ `mention_code_skip`（@bot，代码层跳过）/ `directed_skip`（@指向别处，跳过）/ `debounce_absorbed`（防抖等待期被吸收，未评估）/ `error`；`evaluated` 行另有 `in_dialogue`（当时是否处于与该发送者的接续对话中）和 `debounce`（防抖轨迹：轮数/吸收条数/每轮延迟） |
+| `nouls` | 各 noul 问题的原始概率（含 `is_unfinished`） |
 | `reply_value` | 分值 / 各级概率 / 置信度 |
 | `nominated` / `reason` | 是否提名、按哪条规则提名 |
-| `trigger` | `dry_run`（只记录）/ `skip`（冷却或日限，附 `elapsed_s`/`cooldown_s`/`used` 实测值）/ `dispatch`（已触发） |
+| `trigger` | `dry_run`（只记录）/ `skip`（冷却或日限，附 `elapsed_s`/`cooldown_s`/`used` 实测值；防抖重评否决为 `detail: debounce_rejected`）/ `dispatch`（已触发） |
 | `usage` / `latency_s` / `model` | token 用量、耗时、模型版本 |
 
 调优建议：
@@ -255,6 +294,7 @@ Jev 是 System One 模型：不生成文字，只回答你定义好的结构化�
 3. **热重载会清空内存状态**：消息缓冲、冷却时间、每日计数都在实例内存里（账本不受影响）。
 4. **判定质量与数据强相关**：默认阈值来自 369 条真实中文群聊消息的离线评估。换群、换人设、换语言建议先 dry-run 跑几天看账本再调阈值。
 5. **模型对 CJK 文本的准确率官方标注偏低**：机械性判断（是否点名、是否是问题）实测可用，但语义更细的问题建议先用自己的数据 dry-run 验证。
+6. **Jev 只看文字**：合并转发会通过 OneBot `get_forward_msg` 展开成聊天记录再交给 Jev（只展开一层，最多 20 行、字数上限为 `max_message_chars` 的 4 倍）；图片、视频等仍只有 `[Image]` 这类占位，很难被提名。
 
 ## 成本
 
@@ -285,13 +325,19 @@ TYPESAFE_API_KEY=xxx D:/AstrBot/backend/python/python.exe test_plugin_harness.py
 
 ```
 main.py
-├── on_group_message               生成器 handler（priority=-2）：判断；提名时 yield request_llm
+├── on_group_message               生成器 handler（priority=-2）：判断；防抖吸收；提名时（可选等待后）yield request_llm
+├── _flatten                       消息组件拉平成文本（max_message_chars 截断的唯一入口）
 ├── _call_jev / _call_jev_sync     Jev HTTP 调用（线程池 + 超时 + 429/529 退避重试，URL 可配）
-├── _nominate                      提名：rule=None 走内置两条路径，否则按 nomination_rule 求值
-├── _validate_rule / _eval_rule    规则校验与求值（运算符白名单，不用 eval）
+├── _nominate                      提名：rule=None 走内置三条路径（含接续放宽线），否则按 nomination_rule 求值
+├── _in_active_dialogue            接续对话判定：bot 刚回复过的发送者 + followup 窗口
+├── _debounce_wait                 触发前防抖：is_unfinished 概率映射延迟 → 吸收后续 → 合并重评（≤3 轮）
+├── _coalesce_context              视图级合并：同发送者窗口内连续消息在 state 里连成整段
+├── _validate_rule / _eval_rule    规则校验与求值（运算符白名单，不用 eval；values 注入伪值 continuation）
+├── on_llm_mark_reply              on_llm_response：给 LLM 回复打自持标记（不依赖其他插件代打）
+├── on_after_message_sent          bot 已发送回复回写会话缓冲（is_self），Jev 看得见对话的 bot 侧
 ├── _current_conversation          取/建会话当前对话（不带 conversation 主线不落库）
 ├── on_proactive_refusal_guard     出站守卫：拒答 token 清空 + 退还冷却/日限 + 可选清理历史
-└── _build_state                   拼 Jev 的 state（人设 + 上下文 + 目标消息）
+└── _build_state                   拼 Jev 的 state（人设 + 上下文[含 bot 自己的发言、视图级合并] + 目标消息）
 ```
 
 ## 许可证

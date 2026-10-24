@@ -2,6 +2,65 @@
 
 本项目遵循语义化版本。`0.x` 期间次要版本可能包含配置格式变更，升级前请留意对应条目。
 
+## 0.3.8 — 2026-10-24
+
+**修复：更换中转渠道后 Jev 调用全部 403（Cloudflare 1010 封 Python-urllib 默认 UA）**
+
+生产实锤（2026-09-29 19:05，`jev_provider_url` 换到 `https://api.commandcode.ai/provider/v1/systemone` 后）：所有评估报 `HTTP Error 403: Forbidden`，但同一 key 用 curl 直连同一端点返回 200——请求根本没到鉴权层。实测插件同款 urllib 请求：响应头 `Server: cloudflare`、响应体 `error code: 1010`，即 CF 按**浏览器签名**封禁了 `Python-urllib/3.x` 默认 UA。
+
+- **修复**：`_call_jev_sync` 请求头补自定义 `User-Agent`（`astrbot-plugin-jev_gate/0.3.8`）。任何套 Cloudflare 的官方/中转端点都需要；官方 `api.typesafe.ai` 此前未封纯属侥幸
+- 排查时顺带确认：commandcode 的 403 在其文档里另有"套餐无 API 权限（Go 计划）"一种成因，且错误体会直接写明 `upgrade_required`——如果换 UA 后仍 403，读响应体对号入座
+- 官方端点双 UA 实测（api.typesafe.ai + `/v1/systemone`）：自定义 UA 与 Python-urllib 默认 UA 均 200，`jev-latest` 当前解析为 jev-1.13.0——**自定义 UA 对官方端点无害**
+
+**修复：schema 默认问题集缺 `is_unfinished`（与代码 `DEFAULT_QUESTIONS` 不一致）**
+
+- `_conf_schema.json` 的 `questions` 默认 JSON 字符串漏了防抖专用问题 `is_unfinished`（v0.3.6 引入防抖时只加进了代码兜底 `DEFAULT_QUESTIONS`），新装用户开启防抖即告警并退化为无防抖。已补齐，两处定义保持一致
+- ⚠️ 已装用户的 `questions` 是 text 叶子值，**schema 默认值变更不会迁移进已有配置**——升级到 0.3.8 后若要开防抖，需在配置里手动给 `questions` 补 `is_unfinished`（防抖开启而缺它时日志有告警提示）
+
+**补齐：真实触发（dispatch）现在也打 info 日志**
+
+- 此前评估结果的日志覆盖缺一角：跳过（cooldown/daily_limit）、dry-run 提名、防抖重评否决、no_conversation 都有日志，唯独**真的 yield `request_llm` 的那条路完全静默**——只进账本 `trigger.choice=dispatch`，控制台上 bot 突然开口看不出是门控触发的。根因是 v0.3.4 的「门控命中日志」把"命中"实现成了"被拦下"，与"被触发时输出 info"的设计意图错开。现在触发时打 `[JevGate] 触发主动回复: sender: text | reason=… in_dialogue=… debounce=… model=… latency_s=… conversation=…`，字段与账本 dispatch 行一一对应
+
+**新增：合并转发展开后再交给 Jev 评估（思路来自社区 PR #1，本地重实现）**
+
+- `_flatten` 对合并转发只留 `[Forward]` 占位，Jev 看不到内容，转发几乎拿不到提名（PR 作者实测 reply_value 0.31）。现在 `_expand_forwards` 在 @bot/指向别处早退之后调用 OneBot `get_forward_msg`（复用主线引用解析的 `OneBotClient`/`OneBotPayloadParser`，内部已做各实现参数名兼容）展开一层聊天记录，评估/缓冲/账本/触发提示看到同一份展开文本
+- 与 PR 实现的两点差异：① **取回+解析整体进 try**——`parse_get_forward_payload` 对意外 payload 抛错不再炸掉整条 handler，只退回占位符；② **展开字数上限挂 `max_message_chars`×4**（关闭时 2000），不旁路长度护栏口径，避免多条转发攒同一个窗口把 state 推向 32k 硬限（v0.3.6 缓冲投毒的同款风险面）。行上限固定 20，取回超时 5 秒
+- 非 OneBot 平台、调用失败、超时或解析为空时保留 `[Forward]` 占位，行为与旧版一致；无新增配置项
+
+## 0.3.7 — 2026-09-27
+
+**修复戳一戳误触发主动回复 + 新增 bot 自戳评估（`poke_self_evaluation`，默认关）**
+
+生产实锤（2026-09-27 11:28，群 756741478）：群友 A 戳了群友 B（不是 bot），bot 主动回了「干嘛又戳弥音啦！」。完整链路：aiocqhttp 适配器把 `notify/poke` notice 转成普通群消息事件（`message=[Poke(id=target)]`、`message_str=""`，**不区分 target 是谁**）→ WakingCheckStage 因插件 handler 匹配而放行（`is_wake=True`）→ 本插件把 `_flatten` 出的 `[Poke]` 送进 Jev 评估，戳人者正处于活跃对话（`in_dialogue=true`）中打分过线（reply_value 1.54 + is_good_moment 0.56）→ 提名 → `request_llm`。追加进进行中 agent run 的 follow-up 文本 `[ComponentType.Poke]` 还会丢失被戳者信息（outline 渲染兜底分支不带 id），LLM 只能结合上文脑补，回复语义与真实被戳者都对不上。同日 12:02 的同类事件因 sleep_mode 休眠拦截未复现——非休眠 + 戳人者活跃对话 + Jev 给分过线才触发。
+
+- **戳一戳不再送评估（行为修复，无开关）**：`on_group_message` 新增 Poke 组件检测。含 Poke 的消息照常进评估上下文缓冲（Jev 看全场时仍知道发生过戳一戳），但不再送 Jev 评估、不占日评估额度，账本记 `notice_skip`（`detail=poke_other` / `poke_self`）。戳别人（target≠bot）的事件任何时候都不评估
+- **bot 自戳评估（`poke_self_evaluation`，默认 false）**：开启后，戳 bot 自己的事件经 `_render_poke` 渲染成语义文本（`[戳一戳] 戳了戳的尾巴，并被反过来哈气`——取 OneBot notice 的 `action`/`suffix` 字段，取不到退回 `[Poke]`）替换 `[Poke]` 走完整评估/提名/触发链，冷却/日限/防抖/[PASS] 终审与普通消息同权；关闭时与戳别人同等处理（只进缓冲）
+
+## 0.3.6 — 2026-09-26
+
+**长消息护栏 + 碎片消息合并 + 触发前防抖（Jev 判断"话没说完"才等）**
+
+- **长度护栏**（`max_message_chars`，默认 500，0 = 不截断）：限制的真实口径经三次 API 实测确认为 64k tokens/请求（state+最长问题 32k）——超限返回 400 `max_tokens_exceeded`，插件跳过该消息，但此前**超长条目会留在上下文缓冲里，连带同窗口后续最多 15 条消息的评估一起失败**（缓冲投毒）。现在超长消息在 `_flatten` 单点截断（评估上下文/触发提示/账本同一份，带 `[截断,原N字]` 标记）；完整原文不受影响——群历史由主线独立落库，bot 回复照样看得到全文
+- **缓冲合并**（`merge_window_seconds` 默认 20 秒 + `merge_max_count` 默认 10 条）：同一发送者窗口内的连续消息在发给 Jev 的上下文里合并成一条（`msg1 / msg2 / msg3`），QQ 碎片化打字不再被切成零散小句，有限的 context_window 装下更多有效内容。纯视图变换：缓冲本体保持单条、账本按单条记、合并时浅拷贝不动原始数据
+- **触发前防抖**（`debounce_enabled`，默认关）：解决"burst 第一句就抢答"。新问题 `is_unfinished`（并行提问，零额外成本）判断「话是不是没说完」：概率低于 `debounce_confidence_floor`（0.5）→ 立即触发；越像没说完 → 线性映射到 `[debounce_min_wait_seconds, debounce_max_wait_seconds]`（5/20 秒）等越久（**用 noul 概率做映射变量**，不用单独的 confidence 字段）。等待期同发送者的新消息被吸收（`debounce_absorbed`，不再单独评估、不占日评估额度），安静期满合并重评一遍完整提名：仍提名 → 继续等（最多 3 轮）；否决 → 放弃触发并退还日限额度（`debounce_rejected`）
+  - 延迟只落在少数被提名的消息上，普通消息零影响；@bot 点名路径完全绕开
+  - 实现纪律：等待在生成器 handler 内分片 `asyncio.sleep`，不持锁、**不起后台任务**（热重载安全）；防抖标记带自愈上限，生成器异常退出也不会把人永久静音
+  - 防抖开启但 `questions` 缺 `is_unfinished` 时启动告警并退化为无防抖
+- 测试：`jeval/test_v031_fixes.py` 新增 H 节 24 断言（截断/合并窗口与上限/滑动断链/防抖立即触发/吸收/合并重评/否决退款/轮数上限/缺问题退化）
+
+## 0.3.5 — 2026-09-25
+
+**接续对话识别：bot 回复进入评估上下文 + 接续提名放宽线**
+
+生产实锤（2026-09-25）：bot 18 秒前刚回复"呜！断零食也不干！"，用户接"那拔网线"——省略主语的接话字面无指向，is_mentioned 0.40 / reply_value 1.40 双双够不着内置两条提名线（0.6 / 1.5），落选冷场。此前几条能触发全靠"你/弥音"字面指向。
+
+- **bot 侧上下文（数据层，治本）**：新增 `after_message_sent` 钩子，把 bot 真实发出的 LLM 回复回写会话缓冲（`is_self: True`，state 里渲染为 `bot(我): …`）。此前评估上下文只有群友消息——bot 自己的入站消息在 handler 开头就 return、主动回复也不经过 `event_message_type`，`_build_state` 的 `is_self` 渲染一直是死代码，Jev 判断"是不是接续对话"时根本看不见 bot 刚说过什么。拒答被清空的轮次不会回写（RespondStage 对空链早退，不触发该钩子）
+- **接续提名路径（提名层，立竿见影）**：bot 刚回复过的同一发送者（乐观标记，拒答回滚）在 `followup_window_minutes` 窗口内接着说话时，追加内置第三条提名路径 `reply_value >= thresholds.continuation_reply_value`（新阈值键，默认 **1.2**；设 3.1 以上等效关闭）。兜底链不变：daily_limit 照计数、LLM 终审可 `[PASS]`、拒答退还
+- **`nomination_rule` 注入伪值 `continuation`**（对话中 = 1.0，否则 0.0）：自定义规则可写 `{"all":[{"continuation":{">=":0.5}},{"reply_value":{">=":1.2}}]}`；伪值已从 questions 交叉检查中排除，不会触发"问题不存在"误告警
+- **自持 LLM 回复标记**：新增 `on_llm_response` 钩子自打 `__jevgate_llm_reply__`。此前"守卫覆盖所有 LLM 回复"依赖 fold_fan_formatter/splitter 等环境插件代打 `__is_llm_reply`，裸装市场用户没有它们时静默失效；现在两套标记并存，不再有外部依赖
+- 账本 `evaluated` 行新增 `in_dialogue` 字段，接续提名的 `reason` 前缀 `continuation:`，方便统计该路径实际效果
+- 测试：`jeval/test_v031_fixes.py` 新增 F 节（接续提名 8 例：窗口/换人/过期/窗口 0 不限/伪值/退还破坏连续性）+ G 节（缓冲回写与自持标记 8 例）
+
 ## 0.3.4 — 2026-09-25
 
 **修复 `followup_window_minutes=0` 反被长冷却拦死 + 冷却默认关 + 门控命中日志**
